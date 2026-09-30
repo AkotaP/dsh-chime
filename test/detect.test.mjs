@@ -1,0 +1,652 @@
+/**
+ * `src/client/detect.js` 的单元测试（CONTRACT §3 / §4.4）。
+ *
+ * 全部用例都把假数据直接喂给 `evaluate(statuses, list, activeJobs)`；
+ * 时间通过可注入的假时钟控制，因此 1200ms 防抖到期是确定性的，不依赖真实等待。
+ *
+ * 运行：`node --test test/detect.test.mjs`
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import { COMPLETION_DEBOUNCE_MS, createDetector } from '../src/client/detect.js';
+
+/**
+ * 假时钟：`setTimeout` 只在 `advance()` 时按时间顺序触发，`fireTimers: false`
+ * 时完全不触发（用于「防抖已到期但尚未结算」这种单 tick 场景）。
+ *
+ * @param {{ fireTimers?: boolean }} [options] 选项。
+ * @returns {{ now: () => number, setTimeout: (fn: Function, ms: number) => number, clearTimeout: (id: number) => void, set: (ms: number) => void, advance: (ms: number) => Promise<void>, pending: () => number }} 假时钟。
+ */
+function createClock({ fireTimers = true } = {}) {
+  let current = 0;
+  let seq = 0;
+  /** @type {Map<number, { fn: () => unknown, at: number }>} */
+  const timers = new Map();
+
+  const earliestDue = (target) => {
+    let best = null;
+    for (const [id, timer] of timers) {
+      if (timer.at > target) continue;
+      if (best === null || timer.at < best.timer.at) best = { id, timer };
+    }
+    return best;
+  };
+
+  return {
+    now: () => current,
+    setTimeout(fn, ms) {
+      const id = ++seq;
+      timers.set(id, { fn, at: current + Math.max(0, Number(ms) || 0) });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+    /** 只是把时间往前拨，不触发定时器。 */
+    set(ms) {
+      current += ms;
+    },
+    /** 把时间往前拨，并按顺序触发到点的定时器（等待异步回调）。 */
+    async advance(ms) {
+      const target = current + ms;
+      if (fireTimers) {
+        for (;;) {
+          const due = earliestDue(target);
+          if (due === null) break;
+          timers.delete(due.id);
+          current = due.timer.at;
+          await due.timer.fn();
+        }
+      }
+      current = target;
+    },
+    pending: () => timers.size,
+  };
+}
+
+/**
+ * 建一个判定器 + 假时钟 + 事件收集器。
+ *
+ * @param {{ config?: object, deps?: object, fireTimers?: boolean }} [options] 选项。
+ * @returns {{ detector: any, events: any[], clock: any, kinds: () => string[] }} 测试夹具。
+ */
+function createHarness({ config = {}, deps = {}, fireTimers = true } = {}) {
+  const events = [];
+  const clock = createClock({ fireTimers });
+  const detector = createDetector({
+    onChime: (event) => events.push(event),
+    getConfig: () => ({ backgroundSessions: false, enabled: true, ...config }),
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    onError: () => {},
+    ...deps,
+  });
+  return { detector, events, clock, kinds: () => events.map((event) => event.kind) };
+}
+
+/** @param {Record<string, any>} entries 会话状态条目。 @returns {Map<string, any>} 假 statuses。 */
+function statuses(entries) {
+  return new Map(Object.entries(entries));
+}
+
+/** @param {string} id 会话 id。 @param {any} [extra] 额外字段。 @returns {any} 激活会话行。 */
+function mainRow(id, extra = {}) {
+  return { id, running: false, retainedBy: { mainView: 1 }, ...extra };
+}
+
+/** @param {string} id 会话 id。 @param {any} [extra] 额外字段。 @returns {any} 背景会话行。 */
+function bgRow(id, extra = {}) {
+  return { id, running: false, retainedBy: { mainView: 0 }, ...extra };
+}
+
+/**
+ * 构造假 SessionListSnapshot。
+ *
+ * @param {{ ids?: string[], rows?: Record<string, any>, subagents?: Record<string, string[]>, phase?: string }} [options] 选项。
+ * @returns {any} 假会话列表。
+ */
+function listOf({ ids = [], rows = {}, subagents = {}, phase = 'ready' } = {}) {
+  /** @type {Record<string, any>} */
+  const projectionsBySession = {};
+  for (const [parentId, childIds] of Object.entries(subagents)) {
+    projectionsBySession[parentId] = {
+      values: { subagentCatalog: childIds.map((id) => ({ id })) },
+    };
+  }
+  return { ids, byId: rows, projectionsBySession, phase };
+}
+
+/** @param {any} [extra] 额外字段。 @returns {any} 一条会话状态。 */
+function st(extra = {}) {
+  return { running: false, pendingInteraction: undefined, completionUnread: false, ...extra };
+}
+
+/** 单个激活会话 + 一行列表的常用组合。 */
+const soloList = () => listOf({ ids: ['s1'], rows: { s1: mainRow('s1') } });
+
+// ---------------------------------------------------------------------------
+// approval / question：上升沿
+// ---------------------------------------------------------------------------
+
+test('approval 上升沿只响一次，持续为 approval 不重复响；消失后再次出现重新计一次', () => {
+  const h = createHarness();
+  const list = soloList();
+  const pending = () => statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) });
+
+  const returned = h.detector.evaluate(pending(), list, new Map());
+  assert.deepEqual(
+    returned,
+    [{ kind: 'approval', sessionId: 's1', urgent: true }],
+    'evaluate 的返回值应与 onChime 收到的事件一致',
+  );
+  h.detector.evaluate(pending(), list, new Map());
+  h.detector.evaluate(pending(), list, new Map());
+  assert.deepEqual(h.kinds(), ['approval'], '持续为 approval 时只应响一次');
+
+  // 用户处理完 → pendingInteraction 消失 → 再次出现应重新响
+  h.detector.evaluate(statuses({ s1: st() }), list, new Map());
+  h.detector.evaluate(pending(), list, new Map());
+  assert.deepEqual(h.kinds(), ['approval', 'approval']);
+  assert.deepEqual(h.events[0], { kind: 'approval', sessionId: 's1', urgent: true });
+});
+
+test('question：question 与 plan-review 归为同一类，从无到有各算一次上升沿', () => {
+  const h = createHarness();
+  const list = soloList();
+
+  // plan-review 单独出现 → 走 question 音
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'plan-review' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['question']);
+
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'plan-review' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['question'], '持续 plan-review 不重复响');
+
+  // question 与 plan-review 归为同一类（§3.3），彼此切换不算新事件
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'question' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['question'], '同类切换不重复响');
+
+  // 消失后再次出现 → 新的上升沿
+  h.detector.evaluate(statuses({ s1: st() }), list, new Map());
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'question' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['question', 'question']);
+});
+
+// ---------------------------------------------------------------------------
+// 优先级
+// ---------------------------------------------------------------------------
+
+test('优先级：approval 与「防抖到期的 completed」同一 tick 成立时只响 approval', () => {
+  const h = createHarness({ fireTimers: false });
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map()); // 武装完成
+  h.clock.set(COMPLETION_DEBOUNCE_MS + 100); // 防抖已到期
+
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['approval'], 'completed 必须让位给 approval');
+
+  // completed 已被更高优先级事件吞掉，不会在后续 tick 补响
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['approval']);
+  assert.equal(h.events.length, 1, '同一会话同一时刻只响一个');
+});
+
+test('优先级：question > completed（plan-review 到点时只响 question）', () => {
+  const h = createHarness({ fireTimers: false });
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  h.clock.set(COMPLETION_DEBOUNCE_MS + 100);
+
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'plan-review' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['question']);
+});
+
+test('优先级：interrupted > completed（错误落定时不响 completed）', () => {
+  const h = createHarness({ fireTimers: false });
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  h.clock.set(COMPLETION_DEBOUNCE_MS + 100);
+
+  h.detector.evaluate(statuses({ s1: st({ lastAgentError: 'fatal' }) }), list, new Map());
+  assert.deepEqual(h.kinds(), ['interrupted']);
+});
+
+// ---------------------------------------------------------------------------
+// interrupted：必须排除自动重试
+// ---------------------------------------------------------------------------
+
+test('自动重试：lastAgentError 短暂出现又消失（running 期间）不得触发 interrupted', () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(
+    statuses({ s1: st({ running: true, lastAgentError: 'transient failure' }) }),
+    list,
+    new Map(),
+  );
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+
+  assert.deepEqual(
+    h.events.filter((event) => event.kind === 'interrupted'),
+    [],
+    '重试期间不得触发 interrupted',
+  );
+  assert.deepEqual(h.kinds(), []);
+});
+
+test('自动重试成功后正常结束：不响 interrupted，只响 completed', async () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  // 重试期中瞬时错误
+  h.detector.evaluate(
+    statuses({ s1: st({ running: true, lastAgentError: 'transient failure' }) }),
+    list,
+    new Map(),
+  );
+  // 重试成功：running 继续，错误被清空
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  // 真正结束
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS + 1);
+
+  assert.deepEqual(h.kinds(), ['completed'], '重试成功路径不得出现 interrupted');
+});
+
+test('真中断：running 落 false 且 lastAgentError 仍在 → interrupted，且只响一次', () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(
+    statuses({ s1: st({ running: false, lastAgentError: 'fatal error' }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['interrupted']);
+
+  h.detector.evaluate(
+    statuses({ s1: st({ running: false, lastAgentError: 'fatal error' }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['interrupted'], '同一次错误不重复响');
+
+  // 错误清空后再次出现 → 新的事件期，重新响
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  h.detector.evaluate(
+    statuses({ s1: st({ running: false, lastAgentError: 'fatal again' }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['interrupted', 'interrupted']);
+});
+
+test('错误先出现、running 稍后才落 false：落定后仍响 interrupted（§3.4「之后仍成立」）', () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(
+    statuses({ s1: st({ running: true, lastAgentError: 'fatal error' }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), [], 'running 期间不响');
+
+  h.detector.evaluate(
+    statuses({ s1: st({ running: false, lastAgentError: 'fatal error' }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['interrupted']);
+});
+
+test('interrupted 不依赖被自动重试的错误源：只认 lastAgentError', () => {
+  const h = createHarness();
+  const list = soloList();
+
+  // `promptError` 等其它字段不应被当成中断信号
+  h.detector.evaluate(statuses({ s1: st({ running: false, promptError: 'nope' }) }), list, new Map());
+  assert.deepEqual(h.kinds(), []);
+});
+
+// ---------------------------------------------------------------------------
+// completed：复合判定 + 防抖
+// ---------------------------------------------------------------------------
+
+test('后台 job 在跑时 running=false 不得触发 completed', async () => {
+  const h = createHarness({ fireTimers: false });
+  const list = soloList();
+  const jobs = new Map([['s1', 2]]);
+
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, jobs);
+  h.clock.set(COMPLETION_DEBOUNCE_MS + 5000);
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, jobs);
+  assert.equal(h.events.filter((event) => event.kind === 'completed').length, 0);
+
+  // job 结束后才算完成
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  h.clock.set(COMPLETION_DEBOUNCE_MS + 1);
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  assert.deepEqual(h.kinds(), ['completed']);
+});
+
+test('子代理在跑时不得触发 completed', async () => {
+  const h = createHarness({ fireTimers: false });
+  const list = listOf({
+    ids: ['s1', 'c1'],
+    rows: { s1: mainRow('s1'), c1: bgRow('c1') },
+    subagents: { s1: ['c1'] },
+  });
+  const statusesWithChild = statuses({ s1: st({ running: true }), c1: st({ running: true }) });
+
+  h.detector.evaluate(statusesWithChild, list, new Map());
+  // 父会话落回 idle，但子代理还在跑
+  const parentIdle = statuses({ s1: st({ running: false }), c1: st({ running: true }) });
+  h.detector.evaluate(parentIdle, list, new Map());
+  h.clock.set(COMPLETION_DEBOUNCE_MS + 5000);
+  h.detector.evaluate(parentIdle, list, new Map());
+  assert.equal(h.events.filter((event) => event.kind === 'completed').length, 0);
+
+  // 子代理结束（子代理的 running 也可以只体现在 list.byId 上，见 workspace-client.js:449-451）
+  const childDone = statuses({ s1: st({ running: false }), c1: st({ running: false }) });
+  h.detector.evaluate(childDone, list, new Map());
+  h.clock.set(COMPLETION_DEBOUNCE_MS + 1);
+  h.detector.evaluate(childDone, list, new Map());
+  assert.deepEqual(h.kinds(), ['completed']);
+});
+
+test('初始就空闲的会话不响 completed（必须先观察到活跃）', async () => {
+  const h = createHarness();
+  const list = soloList();
+  const idle = statuses({ s1: st({ running: false }) });
+
+  h.detector.evaluate(idle, list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS * 5);
+  assert.deepEqual(h.kinds(), []);
+});
+
+test('完成判定：全空闲后 1200ms 防抖到期 → completed；窗口内又变 running → 取消', async () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS - 1);
+  assert.deepEqual(h.kinds(), [], '防抖窗口未到时不得响');
+
+  await h.clock.advance(1);
+  assert.deepEqual(h.kinds(), ['completed'], '防抖到期后响 completed');
+});
+
+test('完成防抖窗口内 running 回到 true → 取消本次完成（之后重新空闲再走满窗口）', async () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+
+  await h.clock.advance(600);
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS * 3);
+  assert.deepEqual(h.kinds(), [], '窗口内重新 running 必须取消本次完成');
+
+  // 再次空闲 → 重新计时
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS - 1);
+  assert.deepEqual(h.kinds(), []);
+  await h.clock.advance(1);
+  assert.deepEqual(h.kinds(), ['completed']);
+});
+
+test('完成防抖窗口内出现新 job → 取消本次完成', async () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+
+  await h.clock.advance(600);
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map([['s1', 1]]));
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS * 3);
+  assert.deepEqual(h.kinds(), [], '窗口内出现新 job 必须取消本次完成');
+});
+
+test('等待审批/回答期间不响 completed（空闲但仍在等用户）', async () => {
+  const h = createHarness();
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    list,
+    new Map(),
+  );
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS * 5);
+  assert.deepEqual(h.kinds(), ['approval'], '只响 approval，不响 completed');
+});
+
+// ---------------------------------------------------------------------------
+// 多会话 / 配置
+// ---------------------------------------------------------------------------
+
+test('backgroundSessions=false：非激活会话一律不响', () => {
+  const h = createHarness({ config: { backgroundSessions: false } });
+  const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
+
+  h.detector.evaluate(
+    statuses({ bg: st({ pendingInteraction: { kind: 'approval' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), []);
+});
+
+test('backgroundSessions=true：非激活会话照常响', () => {
+  const h = createHarness({ config: { backgroundSessions: true } });
+  const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
+
+  h.detector.evaluate(
+    statuses({ bg: st({ pendingInteraction: { kind: 'question' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds(), ['question']);
+});
+
+test('backgroundSessions=false：非激活会话落定也不响 completed', async () => {
+  const h = createHarness({ config: { backgroundSessions: false } });
+  const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
+
+  h.detector.evaluate(statuses({ bg: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ bg: st({ running: false }) }), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS + 1);
+  assert.deepEqual(h.kinds(), []);
+});
+
+test('enabled=false 时全局静音，但状态照常推进（重新开启不会补响旧事件）', () => {
+  const h = createHarness({ config: { enabled: false } });
+  const list = soloList();
+  const pending = () => statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) });
+
+  h.detector.evaluate(pending(), list, new Map());
+  assert.deepEqual(h.kinds(), []);
+});
+
+test('多会话各自独立判定，同一 tick 互不影响', () => {
+  const h = createHarness({ config: { backgroundSessions: true } });
+  const list = listOf({
+    ids: ['a', 'b'],
+    rows: { a: mainRow('a'), b: bgRow('b') },
+  });
+  h.detector.evaluate(
+    statuses({
+      a: st({ pendingInteraction: { kind: 'approval' } }),
+      b: st({ lastAgentError: 'fatal' }),
+    }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(h.kinds().sort(), ['approval', 'interrupted']);
+});
+
+test('会话从列表消失（phase=ready）时清理状态，不会把旧状态带到新会话', () => {
+  const h = createHarness();
+  const list = listOf({ ids: ['s1'], rows: { s1: mainRow('s1') } });
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+
+  const emptyList = listOf({ ids: [], rows: {} });
+  h.detector.evaluate(new Map(), emptyList, new Map());
+
+  // 同一个 id 重新出现并已空闲：因为状态被清理过，未观察到活跃 → 不响 completed
+  const again = listOf({ ids: ['s1'], rows: { s1: mainRow('s1') } });
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), again, new Map());
+  h.clock.set(COMPLETION_DEBOUNCE_MS * 3);
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), again, new Map());
+  assert.deepEqual(h.kinds(), []);
+});
+
+// ---------------------------------------------------------------------------
+// evaluate 的输入容错 / start() 接线
+// ---------------------------------------------------------------------------
+
+test('evaluate 容忍缺失的 statuses / 普通对象数据源 / job 数组', () => {
+  const h = createHarness({ config: { backgroundSessions: true } });
+  const list = listOf({ ids: ['s1'], rows: { s1: mainRow('s1') } });
+
+  // statuses 传普通对象；activeJobs 传 job 视图数组（按 status 计数）
+  h.detector.evaluate({ s1: st({ running: false }) }, list, {
+    s1: [{ status: 'running' }, { status: 'stopping' }, { status: 'completed' }],
+  });
+  assert.deepEqual(h.kinds(), [], 'job 数组里有活跃 job，不得当成空闲完成');
+
+  // 完全缺失的数据源不应抛错
+  assert.doesNotThrow(() => h.detector.evaluate(undefined, undefined, undefined));
+});
+
+test('start() 轮询真实快照并判定；dispose() 清理定时器与状态', async () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const clock = createClock();
+  /** @type {Map<string, any>} */
+  const live = new Map([['s1', st({ running: true })]]);
+  const list = soloList();
+  const events = [];
+  let jobCount = 0;
+
+  const detector = createDetector({
+    getStatuses: () => live,
+    getSessionList: () => list,
+    countActiveJobs: async () => jobCount,
+    getConfig: () => ({ backgroundSessions: false, enabled: true }),
+    onChime: (event) => events.push(event),
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    pollMs: 100,
+    onError: () => {},
+  });
+
+  const stop = detector.start();
+  assert.equal(typeof stop, 'function');
+  await flush(); // 初始 tick 结算：观察到 running
+
+  // 空闲 + 后台 job 在跑 → 不得响 completed
+  live.set('s1', st({ running: false }));
+  jobCount = 1;
+  await clock.advance(200);
+  await flush();
+  await clock.advance(2000);
+  await flush();
+  assert.deepEqual(events, [], '后台 job 未结束时不得响 completed');
+
+  // job 结束 → 全部空闲 → 防抖 → completed
+  jobCount = 0;
+  await clock.advance(200);
+  await flush();
+  await clock.advance(COMPLETION_DEBOUNCE_MS + 200);
+  await flush();
+  assert.deepEqual(events.map((event) => event.kind), ['completed']);
+
+  stop();
+  assert.equal(clock.pending(), 0, 'dispose 后不得留下任何定时器');
+
+  // dispose 之后不再求值
+  live.set('s1', st({ running: true }));
+  await clock.advance(1000);
+  await flush();
+  assert.deepEqual(events.map((event) => event.kind), ['completed']);
+});
+
+test('evaluate 在 dispose 之后是空操作', () => {
+  const h = createHarness();
+  const list = soloList();
+  h.detector.dispose();
+  const result = h.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(result, []);
+  assert.deepEqual(h.kinds(), []);
+});
+
+test('依赖抛错不影响判定（getConfig / onChime 异常被吞掉）', () => {
+  const h = createHarness({
+    deps: {
+      getConfig: () => {
+        throw new Error('config boom');
+      },
+      onChime: () => {
+        throw new Error('chime boom');
+      },
+    },
+  });
+  const list = soloList();
+  assert.doesNotThrow(() => {
+    h.detector.evaluate(
+      statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+      list,
+      new Map(),
+    );
+  });
+  assert.deepEqual(h.kinds(), []);
+});

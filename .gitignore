@@ -1,0 +1,7 @@
+node_modules/
+.pnpm-store/
+pnpm-lock.yaml
+.probe/
+*.log
+.DS_Store
+Thumbs.db
