@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { COMPLETION_DEBOUNCE_MS, createDetector } from '../src/client/detect.js';
+import { COMPLETION_DEBOUNCE_MS, MAX_SESSION_DEPTH, createDetector } from '../src/client/detect.js';
 
 /**
  * 假时钟：`setTimeout` 只在 `advance()` 时按时间顺序触发，`fireTimers: false`
@@ -659,10 +659,26 @@ test('依赖抛错不影响判定（getConfig / onChime 异常被吞掉）', () 
 // 不是 `running` 上升沿；差值用可注入的假时钟算，因此完全确定性。
 
 /**
- * 走完一次「观察到活跃 → 空闲武装防抖 → 防抖到期后单 tick 求值」。
+ * 走完一次「观察到活跃 → 空闲武装防抖 → 防抖到期后单 tick 求值」（指定会话）。
  *
  * 用 `clock.set()`（只拨时间、不触发定时器）而不是 `advance()`，
  * 让结算只发生在这一次显式 `evaluate` 上。
+ *
+ * @param {any} h 测试夹具。
+ * @param {string} id 会话 id。
+ * @param {any} list 会话列表。
+ * @param {number} [elapsedMs] 从武装起到结算经过的毫秒数。
+ * @returns {any[]} 最后一次 evaluate 返回的事件。
+ */
+function armSession(h, id, list, elapsedMs = COMPLETION_DEBOUNCE_MS + 1) {
+  h.detector.evaluate(statuses({ [id]: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ [id]: st({ running: false }) }), list, new Map());
+  h.clock.set(elapsedMs);
+  return h.detector.evaluate(statuses({ [id]: st({ running: false }) }), list, new Map());
+}
+
+/**
+ * 走完一次「观察到活跃 → 空闲武装防抖 → 防抖到期后单 tick 求值」（`s1` 版本）。
  *
  * @param {any} h 测试夹具。
  * @param {number} elapsedMs 从武装起到结算经过的毫秒数。
@@ -670,10 +686,7 @@ test('依赖抛错不影响判定（getConfig / onChime 异常被吞掉）', () 
  * @returns {any[]} 最后一次 evaluate 返回的事件。
  */
 function armAndEvaluate(h, elapsedMs, list = soloList()) {
-  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
-  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
-  h.clock.set(elapsedMs);
-  return h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  return armSession(h, 's1', list, elapsedMs);
 }
 
 /**
@@ -798,4 +811,287 @@ test('最短时长门槛只加在 completed 上：approval / question / interrup
     h.detector.evaluate(statuses({ s1: next }), list, new Map());
     assert.deepEqual(h.kinds(), [expected], `${name} 必须立即响，不受最短时长门槛影响`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 全局深度门槛（config.maxDepth）
+// ---------------------------------------------------------------------------
+//
+// 深度取自 `byId[id].parentSessionId` 父链：主对话 = 0，直接子代理 = 1，依此类推。
+// 只在即将发声时按需计算并缓存；该门槛对四类事件都生效；算不出深度时照响。
+
+/**
+ * 带父链的行（深度测试用；仍按「激活会话」处理，避免 backgroundSessions 干扰）。
+ *
+ * @param {string} id 会话 id。
+ * @param {string | null} parentId 父会话 id。
+ * @param {boolean} [subagent] 是否标记 `origin: 'subagent'`。
+ * @returns {any} 假会话行。
+ */
+function depthRow(id, parentId, subagent = false) {
+  return mainRow(id, { parentSessionId: parentId, ...(subagent ? { origin: 'subagent' } : {}) });
+}
+
+/**
+ * 造一条 `target → p1 → p2 …` 的父链，使 `target` 的深度恰好等于 `depth`。
+ *
+ * @param {number} depth 目标深度。
+ * @returns {Record<string, any>} `byId` 行集合。
+ */
+function chainRows(depth) {
+  /** @type {Record<string, any>} */
+  const rows = {};
+  if (depth === 0) {
+    rows.target = depthRow('target', null);
+    return rows;
+  }
+  rows.target = depthRow('target', 'p1', true);
+  for (let level = 1; level <= depth; level += 1) {
+    rows[`p${level}`] = depthRow(`p${level}`, level === depth ? null : `p${level + 1}`, true);
+  }
+  return rows;
+}
+
+/** @param {Record<string, any>} rows 行集合。 @returns {any} 假会话列表。 */
+function depthList(rows) {
+  return listOf({ ids: Object.keys(rows), rows });
+}
+
+/** @returns {any} `target` 会话的一条 approval 状态。 */
+function targetApproval() {
+  return statuses({ target: st({ pendingInteraction: { kind: 'approval' } }) });
+}
+
+/**
+ * 建一个「父链读取可计数」的假列表：`s1 → p1 → p2`（`s1` 深度 2）。
+ *
+ * `p1` / `p2` 用**不可枚举**的 getter 暴露，这样它们不会进入 `collectSessionIds`
+ * 的全量遍历（那会每 tick 读一次 `byId[id]`），计数器只会记到深度遍历的读取。
+ *
+ * @returns {{ list: any, reads: { p1: number, p2: number } }} 列表与各父行的读取次数。
+ */
+function countingChainList() {
+  /** @type {{ p1: number, p2: number }} */
+  const reads = { p1: 0, p2: 0 };
+  const p2Row = depthRow('p2', null);
+  const p1Row = depthRow('p1', 'p2', true);
+  /** @type {Record<string, any>} */
+  const byId = { s1: depthRow('s1', 'p1', true) };
+  Object.defineProperty(byId, 'p1', {
+    enumerable: false,
+    get() {
+      reads.p1 += 1;
+      return p1Row;
+    },
+  });
+  Object.defineProperty(byId, 'p2', {
+    enumerable: false,
+    get() {
+      reads.p2 += 1;
+      return p2Row;
+    },
+  });
+  return { list: { ids: ['s1'], byId, projectionsBySession: {}, phase: 'ready' }, reads };
+}
+
+test('深度门槛：depth 0/1/2 与 maxDepth 0/1 的组合', () => {
+  /** @type {Array<{ depth: number, maxDepth: number, rings: boolean }>} */
+  const cases = [
+    { depth: 0, maxDepth: 0, rings: true },
+    { depth: 1, maxDepth: 0, rings: false },
+    { depth: 1, maxDepth: 1, rings: true },
+    { depth: 2, maxDepth: 1, rings: false },
+  ];
+
+  for (const { depth, maxDepth, rings } of cases) {
+    const h = createHarness({ config: { maxDepth } });
+    h.detector.evaluate(targetApproval(), depthList(chainRows(depth)), new Map());
+    assert.deepEqual(
+      h.kinds(),
+      rings ? ['approval'] : [],
+      `depth=${depth} maxDepth=${maxDepth} 应${rings ? '发声' : '静音'}`,
+    );
+  }
+});
+
+test('深度门槛对四类事件都生效（全局策略，不只是 completed）', () => {
+  const list = depthList(chainRows(1)); // target 深度 1
+
+  const approval = createHarness({ config: { maxDepth: 0 } });
+  approval.detector.evaluate(targetApproval(), list, new Map());
+  assert.deepEqual(approval.kinds(), [], 'approval 受深度门槛约束');
+
+  const question = createHarness({ config: { maxDepth: 0 } });
+  question.detector.evaluate(
+    statuses({ target: st({ pendingInteraction: { kind: 'plan-review' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(question.kinds(), [], 'question 受深度门槛约束');
+
+  const interrupted = createHarness({ config: { maxDepth: 0 } });
+  interrupted.detector.evaluate(statuses({ target: st({ running: true }) }), list, new Map());
+  interrupted.detector.evaluate(
+    statuses({ target: st({ running: false, lastAgentError: 'fatal' }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(interrupted.kinds(), [], 'interrupted 受深度门槛约束');
+
+  const blocked = createHarness({ config: { maxDepth: 0 } });
+  armSession(blocked, 'target', list);
+  assert.deepEqual(blocked.kinds(), [], 'completed 同样受深度门槛约束');
+
+  const allowed = createHarness({ config: { maxDepth: 1 } });
+  armSession(allowed, 'target', list);
+  assert.deepEqual(allowed.kinds(), ['completed'], 'maxDepth=1 时深度 1 的会话照响');
+});
+
+test('深度门槛：算不出深度 → 照响；明确的 subagent 父链断 → 按深度 1', () => {
+  // list 缺失（getSessionList 拿不到快照）
+  const noList = createHarness({ config: { maxDepth: 0 } });
+  noList.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    undefined,
+    new Map(),
+  );
+  assert.deepEqual(noList.kinds(), ['approval'], 'list 缺失 → 算不出深度 → 照响');
+
+  // byId 里没有该会话
+  const noRow = createHarness({ config: { maxDepth: 0 } });
+  noRow.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    listOf({ ids: ['s1'], rows: {} }),
+    new Map(),
+  );
+  assert.deepEqual(noRow.kinds(), ['approval'], 'byId 缺该项 → 照响');
+
+  // 普通会话但父不在 byId（断链，无法证明它是子代理）
+  const broken = createHarness({ config: { maxDepth: 0 } });
+  broken.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    listOf({ ids: ['s1'], rows: { s1: depthRow('s1', 'missing-parent') } }),
+    new Map(),
+  );
+  assert.deepEqual(broken.kinds(), ['approval'], '非 subagent 的断链 → 算不出 → 照响');
+
+  // parentSessionId 为 null 但明确是 subagent → 至少按深度 1
+  const subList = listOf({ ids: ['s1'], rows: { s1: depthRow('s1', null, true) } });
+  const sub = createHarness({ config: { maxDepth: 0 } });
+  sub.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    subList,
+    new Map(),
+  );
+  assert.deepEqual(sub.kinds(), [], 'subagent 没有父链 → 按 1 → maxDepth=0 拦住');
+
+  const subOk = createHarness({ config: { maxDepth: 1 } });
+  subOk.detector.evaluate(
+    statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+    subList,
+    new Map(),
+  );
+  assert.deepEqual(subOk.kinds(), ['approval'], '按深度 1 → maxDepth=1 放行');
+});
+
+test('深度门槛：环形父链不挂死，结果稳定', () => {
+  // A → B → A，两者都没标记 subagent → 算不出深度 → 照响
+  const cyclic = listOf({
+    ids: ['a', 'b'],
+    rows: { a: depthRow('a', 'b'), b: depthRow('b', 'a') },
+  });
+  const h = createHarness({ config: { maxDepth: 0 } });
+  const pendingA = () => statuses({ a: st({ pendingInteraction: { kind: 'approval' } }) });
+
+  h.detector.evaluate(pendingA(), cyclic, new Map());
+  assert.deepEqual(h.kinds(), ['approval'], '环 → 算不出深度 → 照响');
+  h.detector.evaluate(pendingA(), cyclic, new Map());
+  h.detector.evaluate(pendingA(), cyclic, new Map());
+  assert.deepEqual(h.kinds(), ['approval'], '环上重复判定结果稳定（不重复响）');
+
+  // 同一环上但明确是 subagent → 按深度 1 → maxDepth=0 拦住
+  const cyclicSub = listOf({
+    ids: ['a', 'b'],
+    rows: { a: depthRow('a', 'b', true), b: depthRow('b', 'a') },
+  });
+  const blocked = createHarness({ config: { maxDepth: 0 } });
+  blocked.detector.evaluate(pendingA(), cyclicSub, new Map());
+  assert.deepEqual(blocked.kinds(), [], 'subagent 的父链成环 → 按 1 → 被拦住');
+});
+
+test('深度门槛：超长父链在 MAX_SESSION_DEPTH 层封顶（防异常数据长循环）', () => {
+  // 40 层父链：t → p1 → … → p40（p40 无父），远超封顶值。
+  /** @type {Record<string, any>} */
+  const rows = { t: depthRow('t', 'p1', true) };
+  for (let level = 1; level <= 40; level += 1) {
+    rows[`p${level}`] = depthRow(`p${level}`, level === 40 ? null : `p${level + 1}`, true);
+  }
+  const list = depthList(rows);
+  const pending = () => statuses({ t: st({ pendingInteraction: { kind: 'approval' } }) });
+
+  const capped = createHarness({ config: { maxDepth: MAX_SESSION_DEPTH - 1 } });
+  capped.detector.evaluate(pending(), list, new Map());
+  assert.deepEqual(capped.kinds(), [], `深度封顶在 ${MAX_SESSION_DEPTH} → 更低的上限必须拦住`);
+
+  const allowed = createHarness({ config: { maxDepth: MAX_SESSION_DEPTH } });
+  allowed.detector.evaluate(pending(), list, new Map());
+  assert.deepEqual(allowed.kinds(), ['approval'], '封顶值本身仍然照响');
+});
+
+test('深度门槛：maxDepth 非法（NaN / 负数 / 字符串 / null / 缺失）→ 门槛失效、照响', () => {
+  /** @type {Array<[string, any]>} */
+  const cases = [
+    ['NaN', Number.NaN],
+    ['负数', -1],
+    ['字符串 "0"', '0'],
+    ['字符串 "abc"', 'abc'],
+    ['null', null],
+    ['缺失', undefined],
+  ];
+
+  for (const [name, maxDepth] of cases) {
+    const h = createHarness({ config: { maxDepth } });
+    // 深度 3 的会话：只要门槛被误当成生效，就一定不会响。
+    h.detector.evaluate(targetApproval(), depthList(chainRows(3)), new Map());
+    assert.deepEqual(h.kinds(), ['approval'], `${name} 应视为非法 → 门槛关闭、照响`);
+  }
+});
+
+test('深度缓存：只在即将发声时计算，且同一会话只读一次父链', () => {
+  const { list, reads } = countingChainList();
+  const h = createHarness({ config: { maxDepth: 5 } });
+  const approval = () => statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) });
+
+  // 未命中发声点的 tick：根本不碰父链
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  assert.deepEqual(reads, { p1: 0, p2: 0 }, '不发声时不得计算深度');
+
+  // 第一次发声：父链各读一次
+  h.detector.evaluate(approval(), list, new Map());
+  assert.deepEqual(h.kinds(), ['approval']);
+  assert.deepEqual(reads, { p1: 1, p2: 1 }, '首次发声时父链各读一次');
+
+  // 第二次发声（新的上升沿）：必须命中缓存，不得再读父链
+  h.detector.evaluate(statuses({ s1: st() }), list, new Map());
+  h.detector.evaluate(approval(), list, new Map());
+  assert.deepEqual(h.kinds(), ['approval', 'approval']);
+  assert.deepEqual(reads, { p1: 1, p2: 1 }, '重复判定必须命中深度缓存');
+});
+
+test('深度缓存随会话消失清理：重新出现时重新计算父链', () => {
+  const { list, reads } = countingChainList();
+  const h = createHarness({ config: { maxDepth: 5 } });
+  const approval = () => statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) });
+
+  h.detector.evaluate(approval(), list, new Map());
+  assert.deepEqual(h.kinds(), ['approval']);
+  assert.deepEqual(reads, { p1: 1, p2: 1 });
+
+  // 会话从列表消失（phase=ready）→ 深度缓存被清理
+  h.detector.evaluate(new Map(), listOf({ ids: [], rows: {} }), new Map());
+
+  // 同一 id 重新出现并再次发声 → 父链必须重新读取
+  h.detector.evaluate(approval(), list, new Map());
+  assert.deepEqual(h.kinds(), ['approval', 'approval']);
+  assert.deepEqual(reads, { p1: 2, p2: 2 }, '缓存清理后必须重新计算父链');
 });

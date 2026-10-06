@@ -19,6 +19,10 @@
  *   `config.completionMinSeconds` 秒就不响，避免小任务频繁响铃。门槛只决定
  *   「这一次响不响」，不参与内部状态推进；拿不到时间戳或配置没给该字段时**照响**
  *   （主人指定的回落方向：宁可多响，绝不静默）。
+ * - 还有一道**全局深度门槛**（`config.maxDepth`）：按会话在子对话树里的深度决定
+ *   是否发声，`0` 只允许主对话，`1` 再允许直接子代理，依此类推。**四类事件都适用**。
+ *   深度取自 `getSessionList().byId[id].parentSessionId` 的父链，按会话缓存、只在
+ *   即将发声时计算；算不出深度时同样**照响**。
  *
  * @module dsh-chime/detect
  */
@@ -28,6 +32,12 @@ export const COMPLETION_DEBOUNCE_MS = 1200;
 
 /** `start()` 的默认轮询间隔（毫秒）。 */
 export const DEFAULT_POLL_MS = 400;
+
+/**
+ * 父链遍历的深度上限：超过即封顶（异常数据 / 超长链 / 环的防御，绝不长循环）。
+ * 真实子对话树远达不到这个深度。
+ */
+export const MAX_SESSION_DEPTH = 32;
 
 /** 视为「活跃后台 job」的状态（job 计数由调用方计算，此处仅用于容错入参）。 */
 const ACTIVE_JOB_STATUSES = new Set(['running', 'stopping']);
@@ -205,7 +215,7 @@ function readActiveJobs(activeJobs, id) {
  * @param {() => any} [deps.getSessionList] 取 `sessions.list` 快照。
  * @param {(sessionId: string) => Promise<number>} [deps.countActiveJobs] 取某会话活跃 job 数。
  * @param {(event: ChimeEvent) => void} [deps.onChime] 命中事件时回调。
- * @param {() => any} [deps.getConfig] 取配置快照（读 `enabled` / `backgroundSessions` / `completionMinSeconds`）。
+ * @param {() => any} [deps.getConfig] 取配置快照（读 `enabled` / `backgroundSessions` / `completionMinSeconds` / `maxDepth`）。
  * @param {(sessionId: string) => (string | null | undefined)} [deps.getAgentError] 可选：直接读最终错误。
  * @param {(sessionId: string) => any} [deps.getSessionSnapshot] 可选：读 `SessionSnapshot`。
  * @param {(sessionId: string) => (number | null | undefined)} [deps.getLastUserMessageTime] 可选：读该会话最后一条用户消息的时间戳（毫秒，与 `now` 同源）。
@@ -248,6 +258,12 @@ export function createDetector(deps) {
   const states = new Map();
   /** @type {Map<string, number>} 最近一次成功读到的活跃 job 数。 */
   const jobCounts = new Map();
+  /**
+   * 深度缓存：`Map<sessionId, depth>`。父链是会话的固有属性，算一次即可，
+   * 且只在即将发声时按需计算（不随每 tick 的全量遍历走）。算不出的结果不写缓存。
+   * @type {Map<string, number>}
+   */
+  const depthCache = new Map();
   /** 最近一次喂给 `evaluate` 的数据（供防抖定时器在纯求值模式下复用）。 */
   let lastData = { statuses: new Map(), list: EMPTY_LIST, activeJobs: new Map() };
   let disposed = false;
@@ -397,6 +413,89 @@ export function createDetector(deps) {
     return nowMs - startedAt < min * 1000;
   }
 
+  /** @param {any} row 会话列表行。 @returns {boolean} 是否是明确的子代理会话。 */
+  function isSubagentRow(row) {
+    return row?.origin === 'subagent';
+  }
+
+  /**
+   * 沿 `parentSessionId` 父链数出会话深度（主对话 = 0）。
+   *
+   * 防御性约定：
+   * - **环 / 断链**（父不在 `byId`）：父链不可信。该会话明确是 `subagent` 就按深度
+   *   `1`（这样 `maxDepth = 0` 能拦住它），否则算不出 → 返回 `null`（照响）。
+   * - **深度封顶** `MAX_SESSION_DEPTH`：超过即返回封顶值，绝不长循环。
+   * - 行不在 `byId` 里（列表未就绪 / 已消失）→ 返回 `null`（照响）。
+   *
+   * @param {any} list `SessionListSnapshot`。
+   * @param {string} id 会话 id。
+   * @returns {number | null} 深度；算不出时为 null。
+   */
+  function computeSessionDepth(list, id) {
+    const rows = list?.byId;
+    if (rows === null || rows === undefined) return null;
+    const first = rows[id];
+    if (first === undefined || first === null) return null;
+
+    const seen = new Set([id]);
+    let depth = 0;
+    let row = first;
+    while (depth < MAX_SESSION_DEPTH) {
+      const parentId = row?.parentSessionId;
+      if (parentId === undefined || parentId === null || parentId === '') break; // 到达主对话
+      const parentRow = rows[parentId];
+      if (seen.has(parentId) || parentRow === undefined || parentRow === null) {
+        return isSubagentRow(first) ? 1 : null;
+      }
+      seen.add(parentId);
+      row = parentRow;
+      depth += 1;
+    }
+    // subagent 却没有可用的父链：至少按 1，否则 maxDepth = 0 会把它当主对话放行。
+    if (depth === 0 && isSubagentRow(first)) return 1;
+    return depth;
+  }
+
+  /**
+   * 读某会话的深度（带缓存）。
+   *
+   * 只在即将发声时调用。`null`（算不出）**不写缓存**：列表行可能后到
+   * （例如启动期 `list.phase === 'pending'`），一旦能算出来就应当生效。
+   *
+   * @param {any} list `SessionListSnapshot`。
+   * @param {string} id 会话 id。
+   * @returns {number | null} 深度；算不出时为 null。
+   */
+  function sessionDepthOf(list, id) {
+    const cached = depthCache.get(id);
+    if (cached !== undefined) return cached;
+    const depth = computeSessionDepth(list, id);
+    if (typeof depth === 'number') depthCache.set(id, depth);
+    return depth;
+  }
+
+  /**
+   * 全局深度门槛：本次事件是否因为会话「太深」而应当被拦下。
+   *
+   * 配置值只接受真正的数字：`NaN` / 负数 / 字符串 / `null` / `undefined` 一律视为
+   * 门槛关闭（照响）。这里比 `completionMinSeconds` 更严格是有意的 —— `Number('')`
+   * 与 `Number(null)` 都会得到 `0`，若照收就会把「空字符串」误当成 `maxDepth = 0`
+   * 而静默掉全部子代理；任务也明确要求字符串属于非法配置。
+   *
+   * @param {any} list `SessionListSnapshot`。
+   * @param {string} id 会话 id。
+   * @param {any} config 本 tick 的配置快照。
+   * @returns {boolean} true = 会话太深，本次不响。
+   */
+  function depthTooDeep(list, id, config) {
+    const maxDepth = config?.maxDepth;
+    if (typeof maxDepth !== 'number' || !Number.isFinite(maxDepth) || maxDepth < 0) return false;
+    const depth = sessionDepthOf(list, id);
+    // 深度算不出 → 照响（与 completionMinSeconds 的回落方向一致）。
+    if (typeof depth !== 'number') return false;
+    return depth > maxDepth;
+  }
+
   /**
    * 单步求值（CONTRACT §4.4）：本 tick 每个会话最多产出一个事件。
    *
@@ -495,6 +594,10 @@ export function createDetector(deps) {
       // 也不会吞掉下一次正常完成；approval / question / interrupted 不走这道门槛。
       if (kind === 'completed' && completionTooShort(id, nowMs, config)) continue;
 
+      // 全局深度门槛：对四类事件一视同仁。同样只 `continue`（状态已在上方推进），
+      // 且只在即将发声这一步才计算/命中该会话的深度缓存。
+      if (depthTooDeep(sessionList, id, config)) continue;
+
       /** @type {ChimeEvent} */
       const event = { kind, sessionId: id, urgent: kind === 'approval' };
       emitted.push(event);
@@ -511,6 +614,10 @@ export function createDetector(deps) {
         if (ids.has(id)) continue;
         cancelArm(state);
         states.delete(id);
+      }
+      // 深度缓存随会话消失一起清理（父链属性只对仍存在的会话有意义）。
+      for (const id of [...depthCache.keys()]) {
+        if (sessionList.byId?.[id] === undefined) depthCache.delete(id);
       }
     }
 
@@ -597,6 +704,7 @@ export function createDetector(deps) {
       for (const state of states.values()) cancelArm(state);
       states.clear();
       jobCounts.clear();
+      depthCache.clear();
     }
   }
 

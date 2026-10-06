@@ -6,6 +6,23 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.3.0] — not released
+
+### Added
+
+- **Maximum session depth** (`maxDepth`, default `0`): how deep a session may be for its chime to ring. `0` rings only for the main session, `1` also for its direct subagents, and so on. The depth is read from the session list's `parentSessionId` chain and cached per session; it is computed only when a chime is about to play, so the per-tick path pays nothing. A session that is a subagent but whose parent cannot be resolved counts as depth 1; an unreadable depth rings rather than going silent.
+- `test/config.test.mjs`, a store-level suite whose first case enumerates `DEFAULT_CONFIG` so a new top-level field cannot be added without extending both `configsEqual` and that list.
+
+### Fixed
+
+- **The depth and completion-duration fields snapped back to their default value.** `configsEqual` — the comparison `commit` uses to decide whether a write changes anything — never looked at `maxDepth` or `completionMinSeconds`, so updates to exactly those two fields were dropped and the form re-read the default on blur. Every top-level field is now compared.
+- `config.js` rounded these fields with `Math.round` while the settings form clamped them with `Math.floor`; both now floor.
+
+### Changed
+
+- The configuration screenshot in both READMEs (`docs/img/ui.png`) was refreshed.
+- The event-detection suite grew from 33 to 41 cases: the depth gate across all four events, unreadable depths, a broken parent chain, a cyclic chain, a 40-deep chain, invalid thresholds, depth caching, and cache eviction.
+
 ## [0.2.0] — not released
 
 ### Added

@@ -25,12 +25,13 @@ export const DEFAULT_CHIME = Object.freeze({ src: '', volume: 0.8, source: 'url'
 
 /**
  * 默认整份配置。
- * @type {Readonly<{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
+ * @type {Readonly<{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, maxDepth: number, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
  */
 export const DEFAULT_CONFIG = deepFreeze({
   backgroundSessions: false, // 背景会话是否也响
   completionMinSeconds: 10, // 完成音的最短任务时长（秒）；0 = 不设门槛
   enabled: true, // 总开关
+  maxDepth: 0, // 最深发声的会话层级；0 = 只有主对话
   kinds: {
     approval: { src: '', volume: 0.8, source: 'url' },
     question: { src: '', volume: 0.8, source: 'url' },
@@ -56,7 +57,7 @@ export const DEFAULT_CONFIG = deepFreeze({
 
 /**
  * 整份配置快照（`ObservableSnapshot` 风格）。
- * @typedef {{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
+ * @typedef {{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, maxDepth: number, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
  */
 
 /**
@@ -82,6 +83,7 @@ export function normalizeConfig(raw) {
         ? source.backgroundSessions
         : DEFAULT_CONFIG.backgroundSessions,
     completionMinSeconds: normalizeMinSeconds(source.completionMinSeconds),
+    maxDepth: normalizeMaxDepth(source.maxDepth),
     kinds: /** @type {Record<ChimeKind, ChimeConfig>} */ (kinds),
   };
 }
@@ -237,7 +239,25 @@ function normalizeMinSeconds(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return DEFAULT_CONFIG.completionMinSeconds;
   }
-  return Math.min(MIN_SECONDS_MAX, Math.max(0, Math.round(value)));
+  return Math.min(MIN_SECONDS_MAX, Math.max(0, Math.floor(value)));
+}
+
+/** 「最深响应的对话层级」的上限。 */
+const MAX_DEPTH_MAX = 16;
+
+/**
+ * 归一化「最深响应的对话层级」：取整并钳到 0..16；缺失或非法回落默认值。
+ *
+ * `0` 是合法值，表示只有主对话发声。
+ *
+ * @param {unknown} value 原始值。
+ * @returns {number} 0..16 之间的整数层级。
+ */
+function normalizeMaxDepth(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return DEFAULT_CONFIG.maxDepth;
+  }
+  return Math.min(MAX_DEPTH_MAX, Math.max(0, Math.floor(value)));
 }
 
 /**
@@ -249,7 +269,17 @@ function normalizeMinSeconds(value) {
 function configsEqual(a, b) {
   if (a === b) return true;
   if (!a || !b) return false;
-  if (a.enabled !== b.enabled || a.backgroundSessions !== b.backgroundSessions) return false;
+  // Every top-level field must be compared here: `commit` uses this function
+  // to decide whether a write changes anything, so a field missing from this
+  // list can never be updated at all.
+  if (
+    a.enabled !== b.enabled ||
+    a.backgroundSessions !== b.backgroundSessions ||
+    a.completionMinSeconds !== b.completionMinSeconds ||
+    a.maxDepth !== b.maxDepth
+  ) {
+    return false;
+  }
   for (const kind of CHIME_KINDS) {
     const left = a.kinds[kind];
     const right = b.kinds[kind];

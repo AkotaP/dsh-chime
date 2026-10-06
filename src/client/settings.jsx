@@ -43,11 +43,21 @@ const COMPLETION_MIN_FALLBACK = 10;
 /** 最短任务时长的允许上限（秒）；超出一律钳到该值。 */
 const COMPLETION_MIN_MAX = 3600;
 
+/**
+ * 全局「最深响应的对话层级」的兜底值：字段缺失/损坏时按它显示（0 = 只有主对话），
+ * 与 `config.js` 的 `DEFAULT_CONFIG.maxDepth` 保持一致。
+ */
+const MAX_DEPTH_FALLBACK = 0;
+
+/** 最深响应层级的允许上限（层）；超出一律钳到该值。 */
+const MAX_DEPTH_MAX = 16;
+
 /** 整体配置的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG`。 */
 const FALLBACK_CONFIG = {
   enabled: true,
   backgroundSessions: false,
   completionMinSeconds: COMPLETION_MIN_FALLBACK,
+  maxDepth: MAX_DEPTH_FALLBACK,
   kinds: {
     approval: { ...FALLBACK_KIND },
     question: { ...FALLBACK_KIND },
@@ -225,47 +235,87 @@ function normalizeKind(raw) {
 }
 
 /**
- * 把任意输入钳成合法的「最短任务时长」（秒）：空串/非数字/负数/NaN → 0，
- * 超过 3600 → 3600，其余向下取整。
+ * 把任意输入钳成 `0..max` 的整数：空串/非数字/负数/NaN → 0，超过上限 → 上限，
+ * 其余向下取整。`completionMinSeconds`（秒）与 `maxDepth`（层）共用。
+ *
+ * @param {unknown} raw 用户输入或 store 里的原始值
+ * @param {number} max 允许上限
+ * @returns {number} 0..max 的整数
+ */
+function clampBoundedInt(raw, max) {
+  const value = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.min(max, Math.floor(value));
+}
+
+/**
+ * 读取 store 里的有界整数字段。
+ *
+ * 字段缺失/损坏时回落到该字段的默认值，保证界面不会出现 `NaN` 或空白。
+ * 注意与输入态的区别：用户在输入框里清空得到的是 `''`，写进 store 的是 `0`，
+ * 因此这里把「空值」视为缺失、把数字字符串视为有效数字。
+ *
+ * @param {unknown} raw configStore 快照里的原始值
+ * @param {number} fallback 字段缺失/损坏时的默认值
+ * @param {number} max 允许上限
+ * @returns {number} 0..max 的整数
+ */
+function readBoundedInt(raw, fallback, max) {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? clampBoundedInt(raw, max) : fallback;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return fallback;
+    const numeric = Number(trimmed);
+    return Number.isFinite(numeric) ? clampBoundedInt(numeric, max) : fallback;
+  }
+  return fallback;
+}
+
+/**
+ * 把任意输入钳成合法的「最短任务时长」（秒）。
  *
  * @param {unknown} raw 用户输入或 store 里的原始值
  * @returns {number} 0..3600 的整数
  */
 function clampCompletionMinSeconds(raw) {
-  const value = typeof raw === 'number' ? raw : Number(raw);
-  if (!Number.isFinite(value) || value < 0) return 0;
-  return Math.min(COMPLETION_MIN_MAX, Math.floor(value));
+  return clampBoundedInt(raw, COMPLETION_MIN_MAX);
 }
 
 /**
- * 读取 store 里的顶层 `completionMinSeconds`。
- *
- * 字段缺失/损坏时回落到默认值（10），保证界面不会出现 `NaN` 或空白。
- * 注意与输入态的区别：用户在输入框里清空得到的是 `''`，写进 store 的是 `0`，
- * 因此这里把「空值」视为缺失、把数字字符串视为有效数字。
+ * 读取 store 里的顶层 `completionMinSeconds`（缺失/损坏 → 10）。
  *
  * @param {unknown} raw configStore 快照里的原始值
  * @returns {number} 0..3600 的整数
  */
 function readCompletionMinSeconds(raw) {
-  if (raw === undefined || raw === null) return COMPLETION_MIN_FALLBACK;
-  if (typeof raw === 'number') {
-    return Number.isFinite(raw) ? clampCompletionMinSeconds(raw) : COMPLETION_MIN_FALLBACK;
-  }
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    if (!trimmed) return COMPLETION_MIN_FALLBACK;
-    const numeric = Number(trimmed);
-    return Number.isFinite(numeric) ? clampCompletionMinSeconds(numeric) : COMPLETION_MIN_FALLBACK;
-  }
-  return COMPLETION_MIN_FALLBACK;
+  return readBoundedInt(raw, COMPLETION_MIN_FALLBACK, COMPLETION_MIN_MAX);
+}
+
+/**
+ * 把任意输入钳成合法的「最深响应的对话层级」（层）。
+ *
+ * @param {unknown} raw 用户输入或 store 里的原始值
+ * @returns {number} 0..16 的整数
+ */
+function clampMaxDepth(raw) {
+  return clampBoundedInt(raw, MAX_DEPTH_MAX);
+}
+
+/**
+ * 读取 store 里的顶层 `maxDepth`（缺失/损坏 → 0 = 只有主对话）。
+ *
+ * @param {unknown} raw configStore 快照里的原始值
+ * @returns {number} 0..16 的整数
+ */
+function readMaxDepth(raw) {
+  return readBoundedInt(raw, MAX_DEPTH_FALLBACK, MAX_DEPTH_MAX);
 }
 
 /**
  * 归一化整份配置；缺失/损坏字段回落到默认值，保证渲染不崩。
  *
  * @param {unknown} raw 来自 configStore 的快照
- * @returns {{ enabled: boolean, backgroundSessions: boolean, completionMinSeconds: number, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
+ * @returns {{ enabled: boolean, backgroundSessions: boolean, completionMinSeconds: number, maxDepth: number, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
  */
 function normalizeConfig(raw) {
   const value = raw && typeof raw === 'object' ? raw : {};
@@ -277,6 +327,7 @@ function normalizeConfig(raw) {
     backgroundSessions:
       typeof value.backgroundSessions === 'boolean' ? value.backgroundSessions : FALLBACK_CONFIG.backgroundSessions,
     completionMinSeconds: readCompletionMinSeconds(value.completionMinSeconds),
+    maxDepth: readMaxDepth(value.maxDepth),
     kinds,
   };
 }
@@ -462,6 +513,10 @@ export function ChimeSettings(props) {
    * store 回写打断）；`undefined` 表示未编辑，直接显示 store 里的规范值。
    */
   const [completionDraft, setCompletionDraft] = useState(undefined);
+  /** 全局「最深响应的对话层级」输入框的草稿，语义同上。 */
+  const [maxDepthDraft, setMaxDepthDraft] = useState(undefined);
+  /** 最深层级输入框的显示值：草稿优先，否则显示 store 里的规范值。 */
+  const maxDepthDisplay = maxDepthDraft !== undefined ? maxDepthDraft : String(config.maxDepth);
 
   // store 采纳了草稿（或外部改动与草稿一致）后清掉草稿，让快照重新成为唯一事实来源。
   useEffect(() => {
@@ -568,6 +623,23 @@ export function ChimeSettings(props) {
   /** 失焦：收起草稿，输入框改为显示 store 里的规范值。 */
   const onCompletionMinBlur = () => setCompletionDraft(undefined);
 
+  /**
+   * 全局「最深响应的对话层级」变化（顶层字段 `maxDepth`）。
+   *
+   * 与「最短任务时长」同一套草稿策略：输入框保留用户原文，写进 store 的永远是
+   * 钳制后的整数（空串/非数字/负数/NaN → 0，超过 16 → 16，向下取整），
+   * 失焦时才收起草稿、显示规范值。
+   *
+   * @param {string} text number 输入框的原始字符串
+   */
+  const onMaxDepthChange = (text) => {
+    setMaxDepthDraft(String(text));
+    updateConfig({ maxDepth: clampMaxDepth(text) });
+  };
+
+  /** 失焦：收起草稿，输入框改为显示 store 里的规范值。 */
+  const onMaxDepthBlur = () => setMaxDepthDraft(undefined);
+
   /** 清掉某个音效的输入框草稿（store 成为唯一事实来源）。 */
   const dropDraft = (kind) => {
     setDrafts((previous) => {
@@ -641,6 +713,30 @@ export function ChimeSettings(props) {
           <span>{tt('backgroundSessions')}</span>
         </label>
         <p style={styles.hint}>{tt('backgroundSessionsHint')}</p>
+
+        <div style={styles.completionMin}>
+          <div style={styles.row}>
+            <label style={styles.volumeLabel} htmlFor="dsh-chime-max-depth">
+              {tt('maxDepthLabel')}
+            </label>
+            <input
+              id="dsh-chime-max-depth"
+              type="number"
+              style={styles.numberInput}
+              min="0"
+              max="16"
+              step="1"
+              inputMode="numeric"
+              value={maxDepthDisplay}
+              aria-label={tt('maxDepthLabel')}
+              onChange={(event) => onMaxDepthChange(event.target.value)}
+              onBlur={onMaxDepthBlur}
+            />
+            <span style={styles.hint}>{tt('maxDepthUnit')}</span>
+          </div>
+          <p style={styles.hint}>{tt('maxDepthHint')}</p>
+        </div>
+
         {config.enabled ? null : <p style={styles.hint}>{tt('enabledHint')}</p>}
       </section>
 

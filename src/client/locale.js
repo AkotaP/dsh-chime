@@ -31,6 +31,11 @@ export const zh = {
   backgroundSessions: '背景会话也响',
   backgroundSessionsHint: '关闭时只有当前激活的会话会发声；开启后后台会话的事件也会响。',
 
+  // —— 全局：最深响应的对话层级 ——
+  maxDepthLabel: '最深响应的对话层级',
+  maxDepthUnit: '层（0 = 只有主对话）',
+  maxDepthHint: '0 = 只有主对话发声；1 = 主对话和它的直接子代理；依此类推。层级更深的事件不会响。',
+
   // —— 四类事件 ——
   kind_approval_label: '权限审批',
   kind_approval_hint: '等待你批准工具调用时。',
@@ -80,6 +85,12 @@ export const en = {
   backgroundSessions: 'Also play in background sessions',
   backgroundSessionsHint:
     'When off, only the active session makes sound. When on, events in background sessions play too.',
+
+  // —— Global: maximum session depth ——
+  maxDepthLabel: 'Maximum session depth',
+  maxDepthUnit: 'levels (0 = main session only)',
+  maxDepthHint:
+    '0 rings only for the main session; 1 also rings for its direct subagents, and so on. Events from deeper sessions stay silent.',
 
   // —— The four events ——
   kind_approval_label: 'Approval',
