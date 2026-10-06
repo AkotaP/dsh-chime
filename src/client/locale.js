@@ -47,6 +47,11 @@ export const zh = {
   preview: '试听',
   clear: '清除',
 
+  // —— 「完成」卡片的最短任务时长门槛 ——
+  completionMinLabel: '最短任务时长',
+  completionMinUnit: '秒（0 = 总是响）',
+  completionMinHint: '距上一次用户输入不足这个秒数时，完成音不响，避免小任务频繁提示。',
+
   // —— 行内错误 ——
   actionFailed: '操作失败',
   previewEmpty: '未设置音效，无法试听。',
@@ -92,6 +97,12 @@ export const en = {
   volume: 'Volume',
   preview: 'Preview',
   clear: 'Clear',
+
+  // —— Completion card: minimum task duration ——
+  completionMinLabel: 'Minimum task duration',
+  completionMinUnit: 'seconds (0 = always ring)',
+  completionMinHint:
+    'Skip the completion chime when less than this many seconds have passed since your last message, so small tasks stay quiet.',
 
   // —— Inline errors ——
   actionFailed: 'Operation failed',

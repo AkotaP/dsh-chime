@@ -650,3 +650,152 @@ test('依赖抛错不影响判定（getConfig / onChime 异常被吞掉）', () 
   });
   assert.deepEqual(h.kinds(), []);
 });
+
+// ---------------------------------------------------------------------------
+// completed：最短任务时长门槛（config.completionMinSeconds）
+// ---------------------------------------------------------------------------
+//
+// 计时起点是**用户消息时间戳**（由可选依赖 `getLastUserMessageTime` 提供），
+// 不是 `running` 上升沿；差值用可注入的假时钟算，因此完全确定性。
+
+/**
+ * 走完一次「观察到活跃 → 空闲武装防抖 → 防抖到期后单 tick 求值」。
+ *
+ * 用 `clock.set()`（只拨时间、不触发定时器）而不是 `advance()`，
+ * 让结算只发生在这一次显式 `evaluate` 上。
+ *
+ * @param {any} h 测试夹具。
+ * @param {number} elapsedMs 从武装起到结算经过的毫秒数。
+ * @param {any} [list] 会话列表。
+ * @returns {any[]} 最后一次 evaluate 返回的事件。
+ */
+function armAndEvaluate(h, elapsedMs, list = soloList()) {
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+  h.clock.set(elapsedMs);
+  return h.detector.evaluate(statuses({ s1: st({ running: false }) }), list, new Map());
+}
+
+/**
+ * 建一个带门槛依赖的夹具：假时钟从 0 起，`getLastUserMessageTime` 由测试控制。
+ *
+ * @param {any} userAt 用户消息时间戳（相对假时钟）。
+ * @param {any} min `config.completionMinSeconds` 的值。
+ * @returns {any} 测试夹具。
+ */
+function minHarness(userAt, min) {
+  return createHarness({
+    config: { completionMinSeconds: min },
+    deps: { getLastUserMessageTime: () => userAt },
+  });
+}
+
+test('最短时长门槛：距上次用户输入不足 min 秒 → 不响 completed（含差 1ms 的边界）', () => {
+  // 只跑了 3 秒（min = 10 秒）
+  const short = minHarness(0, 10);
+  const returned = armAndEvaluate(short, 3000);
+  assert.deepEqual(short.kinds(), [], '只跑了 3 秒不得响 completed');
+  assert.deepEqual(returned, [], 'evaluate 的返回值同样不得包含 completed');
+
+  // 贴着边界：差 1ms 到线
+  const almost = minHarness(0, 10);
+  armAndEvaluate(almost, 10_000 - 1);
+  assert.deepEqual(almost.kinds(), [], '差 1ms 到线仍不得响 completed');
+});
+
+test('最短时长门槛：刚好到线 / 长任务 → 照响 completed', () => {
+  // 距用户输入正好 10 秒（>= min * 1000）
+  const exact = minHarness(0, 10);
+  armAndEvaluate(exact, 10_000);
+  assert.deepEqual(exact.kinds(), ['completed'], '刚好到线必须响');
+
+  // 长任务：60 秒
+  const long = minHarness(0, 10);
+  armAndEvaluate(long, 60_000);
+  assert.deepEqual(long.kinds(), ['completed'], '长任务必须响');
+});
+
+test('最短时长门槛：min <= 0 / 配置没给该字段 → 门槛关闭，照响', () => {
+  /** @type {Array<[string, any]>} */
+  const cases = [
+    ['min = 0', 0],
+    ['min 为负数', -5],
+    ['min 为 NaN', Number.NaN],
+    ['配置缺该字段', undefined],
+  ];
+
+  for (const [name, min] of cases) {
+    const h = minHarness(0, min); // 用户消息就在当前时刻，门槛若生效必被拦
+    armAndEvaluate(h, COMPLETION_DEBOUNCE_MS + 1);
+    assert.deepEqual(h.kinds(), ['completed'], `${name} 时门槛应关闭，照响`);
+  }
+});
+
+test('最短时长门槛：拿不到用户消息时间戳 → 照响（缺失 / null / undefined / 非有限数 / 抛错）', () => {
+  /** @type {Array<[string, object]>} */
+  const cases = [
+    ['依赖缺失', {}],
+    ['返回 null', { getLastUserMessageTime: () => null }],
+    ['返回 undefined', { getLastUserMessageTime: () => undefined }],
+    ['返回 NaN', { getLastUserMessageTime: () => Number.NaN }],
+    ['返回 Infinity', { getLastUserMessageTime: () => Number.POSITIVE_INFINITY }],
+    ['返回字符串', { getLastUserMessageTime: () => 'not-a-number' }],
+    [
+      '依赖抛错',
+      {
+        getLastUserMessageTime: () => {
+          throw new Error('no message index');
+        },
+      },
+    ],
+  ];
+
+  for (const [name, deps] of cases) {
+    const h = createHarness({ config: { completionMinSeconds: 10 }, deps });
+    assert.doesNotThrow(() => {
+      armAndEvaluate(h, COMPLETION_DEBOUNCE_MS + 1);
+    }, `${name} 时不得把异常抛出判定器`);
+    assert.deepEqual(h.kinds(), ['completed'], `${name} 时必须照响，绝不静默`);
+  }
+});
+
+test('最短时长门槛只拦「响」：短任务被拦后状态照常推进，不补响也不吞下一次完成', () => {
+  const list = soloList();
+  const idle = statuses({ s1: st({ running: false }) });
+  let userAt = 0; // 用户消息时间戳（与假时钟同源）
+  const h = createHarness({
+    config: { completionMinSeconds: 10 },
+    deps: { getLastUserMessageTime: () => userAt },
+  });
+
+  armAndEvaluate(h, 3000); // 距用户输入 3 秒 < 10 秒 → 本次不响
+  assert.deepEqual(h.kinds(), []);
+
+  // 越过门槛窗口后也不得补响（seenActive / armAt 已经在上一 tick 推进掉了）
+  h.clock.set(60_000);
+  h.detector.evaluate(idle, list, new Map());
+  h.detector.evaluate(idle, list, new Map());
+  assert.deepEqual(h.kinds(), [], '短任务过后不得补响 completed');
+
+  // 下一次真实完成：用户消息已是 60 秒前 → 门槛放开，照常响
+  userAt = h.clock.now() - 60_000;
+  armAndEvaluate(h, COMPLETION_DEBOUNCE_MS + 1);
+  assert.deepEqual(h.kinds(), ['completed'], '下一次正常完成不得被吞');
+});
+
+test('最短时长门槛只加在 completed 上：approval / question / interrupted 始终立即响', () => {
+  const list = soloList();
+  // 用户消息就在当前时刻（差 0ms）——若门槛误加到 attention 事件上，这三类都会哑掉。
+  const cases = [
+    ['approval', st({ pendingInteraction: { kind: 'approval' } }), 'approval'],
+    ['question', st({ pendingInteraction: { kind: 'plan-review' } }), 'question'],
+    ['interrupted', st({ lastAgentError: 'fatal' }), 'interrupted'],
+  ];
+
+  for (const [name, next, expected] of cases) {
+    const h = minHarness(0, 10);
+    h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+    h.detector.evaluate(statuses({ s1: next }), list, new Map());
+    assert.deepEqual(h.kinds(), [expected], `${name} 必须立即响，不受最短时长门槛影响`);
+  }
+});

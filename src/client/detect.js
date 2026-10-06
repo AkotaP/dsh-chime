@@ -15,6 +15,10 @@
  *   （`running === false`）时才响；重试期间的瞬时错误（running 仍为 true，
  *   或重试成功后错误被清空）一律不响（§3.4，需求 4）。
  * - `completed` 走「曾活跃 → 全空闲 → 防抖到期」三段式复合判定（§3.5）。
+ * - `completed` 另有一道**最短任务时长门槛**：距该会话最后一条用户消息不足
+ *   `config.completionMinSeconds` 秒就不响，避免小任务频繁响铃。门槛只决定
+ *   「这一次响不响」，不参与内部状态推进；拿不到时间戳或配置没给该字段时**照响**
+ *   （主人指定的回落方向：宁可多响，绝不静默）。
  *
  * @module dsh-chime/detect
  */
@@ -193,6 +197,7 @@ function readActiveJobs(activeJobs, id) {
  * | `now`, `setTimeout`, `clearTimeout` | 注入时钟/定时器（默认取全局），单测用假时钟即可让 1200ms 防抖确定性地到期 |
  * | `debounceMs`, `pollMs` | 覆盖防抖窗口与轮询间隔 |
  * | `getAgentError` / `getSessionSnapshot` | 可选：读出 `SessionSnapshot.lastAgentError`。DSH 的 `SessionStatus`（§2.2）本身不带该字段，若不提供则本判定器只会从 `statuses` 条目或 `list.byId[id]` 上读同名字段 |
+ * | `getLastUserMessageTime` | 可选：读出该会话最后一条用户消息的时间戳，用于 `completed` 的最短任务时长门槛；拿不到（缺失 / 返回 null、undefined、非有限数 / 抛错）时一律照响 |
  * | `onError` | 错误上报（默认 `console.warn`），判定永不因依赖抛错而中断 |
  *
  * @param {object} [deps] 依赖。
@@ -200,9 +205,10 @@ function readActiveJobs(activeJobs, id) {
  * @param {() => any} [deps.getSessionList] 取 `sessions.list` 快照。
  * @param {(sessionId: string) => Promise<number>} [deps.countActiveJobs] 取某会话活跃 job 数。
  * @param {(event: ChimeEvent) => void} [deps.onChime] 命中事件时回调。
- * @param {() => any} [deps.getConfig] 取配置快照（读 `enabled` / `backgroundSessions`）。
+ * @param {() => any} [deps.getConfig] 取配置快照（读 `enabled` / `backgroundSessions` / `completionMinSeconds`）。
  * @param {(sessionId: string) => (string | null | undefined)} [deps.getAgentError] 可选：直接读最终错误。
  * @param {(sessionId: string) => any} [deps.getSessionSnapshot] 可选：读 `SessionSnapshot`。
+ * @param {(sessionId: string) => (number | null | undefined)} [deps.getLastUserMessageTime] 可选：读该会话最后一条用户消息的时间戳（毫秒，与 `now` 同源）。
  * @param {() => number} [deps.now] 可选：当前时间戳。
  * @param {(fn: () => void, ms: number) => unknown} [deps.setTimeout] 可选：定时器。
  * @param {(handle: unknown) => void} [deps.clearTimeout] 可选：取消定时器。
@@ -220,6 +226,7 @@ export function createDetector(deps) {
     getConfig = () => ({}),
     getAgentError = null,
     getSessionSnapshot = null,
+    getLastUserMessageTime = null,
     now = () => Date.now(),
     setTimeout: schedule = (fn, ms) => setTimeout(fn, ms),
     clearTimeout: cancel = (handle) => clearTimeout(handle),
@@ -350,6 +357,47 @@ export function createDetector(deps) {
   }
 
   /**
+   * 读某个会话最后一条用户消息的时间戳。
+   *
+   * 拿不到时一律返回 `undefined`（= 照响）：依赖缺失、返回 null / undefined /
+   * 非有限数、或依赖本身抛错，都视同「没有时间戳」，绝不让门槛把声音静默掉。
+   *
+   * @param {string} id 会话 id。
+   * @returns {number | undefined} 时间戳（毫秒，与 `now()` 同源）；拿不到时为 undefined。
+   */
+  function lastUserMessageTimeFor(id) {
+    if (typeof getLastUserMessageTime !== 'function') return undefined;
+    try {
+      const value = getLastUserMessageTime(id);
+      return typeof value === 'number' ? value : undefined;
+    } catch (error) {
+      report(error, 'getLastUserMessageTime');
+      return undefined;
+    }
+  }
+
+  /**
+   * 「最短任务时长」门槛：本次 `completed` 是否应当被拦下。
+   *
+   * 计时起点是**用户消息时间戳**（不是 `running` 上升沿）——中途等审批/回答不会
+   * 产生新的 `user/message`，因此长任务不会因为一次审批被误判成刚开的新任务。
+   *
+   * @param {string} id 会话 id。
+   * @param {number} nowMs 本 tick 的时间（来自可注入时钟）。
+   * @param {any} config 本 tick 的配置快照。
+   * @returns {boolean} true = 任务太短，本次不响 completed。
+   */
+  function completionTooShort(id, nowMs, config) {
+    const min = Number(config?.completionMinSeconds);
+    // 门槛关闭 / 配置没给该字段（NaN）→ 照响。
+    if (!Number.isFinite(min) || min <= 0) return false;
+    const startedAt = lastUserMessageTimeFor(id);
+    // 拿不到用户消息时间戳 → 照响（主人指定的回落方向）。
+    if (!Number.isFinite(startedAt)) return false;
+    return nowMs - startedAt < min * 1000;
+  }
+
+  /**
    * 单步求值（CONTRACT §4.4）：本 tick 每个会话最多产出一个事件。
    *
    * @param {unknown} statuses `Map<SessionId, SessionStatus>`（也容忍普通对象）。
@@ -441,6 +489,11 @@ export function createDetector(deps) {
 
       // 非激活会话 / 总开关关闭时不出声；状态照常推进，避免解禁后补响旧事件。
       if (!audible) continue;
+
+      // completed 的最短任务时长门槛：只决定「这一次响不响」。
+      // 上面的状态推进（seenActive 复位、取消防抖）已经完成，所以短任务既不补响，
+      // 也不会吞掉下一次正常完成；approval / question / interrupted 不走这道门槛。
+      if (kind === 'completed' && completionTooShort(id, nowMs, config)) continue;
 
       /** @type {ChimeEvent} */
       const event = { kind, sessionId: id, urgent: kind === 'approval' };

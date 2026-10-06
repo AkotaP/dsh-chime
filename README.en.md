@@ -29,6 +29,8 @@ A DeepSeek Harness (DSH) **web** plugin for per-event notification chimes.
 
 Changes take effect immediately; there is no save button.
 
+![Configuration UI](docs/img/ui.png)
+
 ## Install
 
 > Installing changes the profile configuration under `%USERPROFILE%\.dsh` and requires restarting DSH (which interrupts running sessions). Please confirm first.

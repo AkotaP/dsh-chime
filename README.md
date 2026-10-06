@@ -29,6 +29,8 @@ DSH（DeepSeek Harness）Web 通知音效插件。
 
 所有修改即时生效，没有单独的保存按钮。
 
+![配置界面](docs/img/ui.png)
+
 ## 安装
 
 > 安装会改动 `%USERPROFILE%\.dsh` 下的 profile 配置，并且需要重启 DSH（重启会打断正在跑的会话）。请确认后执行。

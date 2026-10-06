@@ -25,10 +25,11 @@ export const DEFAULT_CHIME = Object.freeze({ src: '', volume: 0.8, source: 'url'
 
 /**
  * 默认整份配置。
- * @type {Readonly<{ backgroundSessions: boolean, enabled: boolean, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
+ * @type {Readonly<{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
  */
 export const DEFAULT_CONFIG = deepFreeze({
   backgroundSessions: false, // 背景会话是否也响
+  completionMinSeconds: 10, // 完成音的最短任务时长（秒）；0 = 不设门槛
   enabled: true, // 总开关
   kinds: {
     approval: { src: '', volume: 0.8, source: 'url' },
@@ -55,7 +56,7 @@ export const DEFAULT_CONFIG = deepFreeze({
 
 /**
  * 整份配置快照（`ObservableSnapshot` 风格）。
- * @typedef {{ backgroundSessions: boolean, enabled: boolean, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
+ * @typedef {{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
  */
 
 /**
@@ -80,6 +81,7 @@ export function normalizeConfig(raw) {
       typeof source.backgroundSessions === 'boolean'
         ? source.backgroundSessions
         : DEFAULT_CONFIG.backgroundSessions,
+    completionMinSeconds: normalizeMinSeconds(source.completionMinSeconds),
     kinds: /** @type {Record<ChimeKind, ChimeConfig>} */ (kinds),
   };
 }
@@ -218,6 +220,24 @@ function normalizeSource(value) {
 function normalizeVolume(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_CHIME.volume;
   return Math.min(1, Math.max(0, value));
+}
+
+/** 「最短任务时长」的上限（秒）。 */
+const MIN_SECONDS_MAX = 3600;
+
+/**
+ * 归一化「最短任务时长」：取整并钳到 0..3600；缺失或非法回落默认值。
+ *
+ * `0` 是合法值，表示关闭门槛（总是响）。
+ *
+ * @param {unknown} value 原始值。
+ * @returns {number} 0..3600 之间的整秒数。
+ */
+function normalizeMinSeconds(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return DEFAULT_CONFIG.completionMinSeconds;
+  }
+  return Math.min(MIN_SECONDS_MAX, Math.max(0, Math.round(value)));
 }
 
 /**

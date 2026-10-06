@@ -6,15 +6,20 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.2.0] — not released
+
 ### Added
 
+- **Minimum task duration for the completion chime** (default **10 seconds**): the completion chime stays silent when less than this many seconds have passed since your last message, so small tasks stop ringing. The clock is read from the newest `user/message` in the session log, so waiting for an approval or answering a question never resets it. `0` rings on every completion. When that timestamp cannot be read the chime rings — the gate is opt-in silence, never accidental silence.
 - English and Chinese dictionaries (`src/client/locale.js`) registered through the DSH locale service, with the settings form rendered through the bound `t`.
 - `README.en.md` mirroring the Chinese README; both link each other.
+- A configuration screenshot in both READMEs (`docs/img/ui.png`).
 - `LICENSE`, `.gitignore`, and this changelog.
 
 ### Changed
 
 - DSH compatibility declared as `>=0.2.0-rc.2` in `engines.dsh` and in the `@deepseek-ai/dsh` peer dependency.
+- The event-detection suite grew from 27 to 33 cases: short and long tasks, the exact boundary, a disabled gate, unreadable timestamps, state still advancing after a suppressed chime, and attention events staying unaffected.
 
 ### Removed
 

@@ -34,10 +34,20 @@ const KIND_ORDER = ['approval', 'question', 'interrupted', 'completed'];
 /** 单个音效的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CHIME`。 */
 const FALLBACK_KIND = { src: '', volume: 0.8, source: 'url' };
 
+/**
+ * 「完成」音效的最短任务时长（秒）的兜底值：字段缺失/损坏时按它显示，
+ * 与 `config.js` 的 `DEFAULT_CONFIG.completionMinSeconds` 保持一致。
+ */
+const COMPLETION_MIN_FALLBACK = 10;
+
+/** 最短任务时长的允许上限（秒）；超出一律钳到该值。 */
+const COMPLETION_MIN_MAX = 3600;
+
 /** 整体配置的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG`。 */
 const FALLBACK_CONFIG = {
   enabled: true,
   backgroundSessions: false,
+  completionMinSeconds: COMPLETION_MIN_FALLBACK,
   kinds: {
     approval: { ...FALLBACK_KIND },
     question: { ...FALLBACK_KIND },
@@ -150,6 +160,22 @@ const styles = {
   spacer: {
     flex: '1 1 auto',
   },
+  /** 「完成」卡片的最短任务时长区块（标签 + number 输入框 + 说明）。 */
+  completionMin: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+  },
+  numberInput: {
+    width: '92px',
+    padding: '5px 8px',
+    borderRadius: '6px',
+    border: '1px solid rgba(127, 127, 127, 0.35)',
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    fontSize: '12px',
+  },
   summary: {
     display: 'flex',
     flexDirection: 'column',
@@ -199,10 +225,47 @@ function normalizeKind(raw) {
 }
 
 /**
+ * 把任意输入钳成合法的「最短任务时长」（秒）：空串/非数字/负数/NaN → 0，
+ * 超过 3600 → 3600，其余向下取整。
+ *
+ * @param {unknown} raw 用户输入或 store 里的原始值
+ * @returns {number} 0..3600 的整数
+ */
+function clampCompletionMinSeconds(raw) {
+  const value = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.min(COMPLETION_MIN_MAX, Math.floor(value));
+}
+
+/**
+ * 读取 store 里的顶层 `completionMinSeconds`。
+ *
+ * 字段缺失/损坏时回落到默认值（10），保证界面不会出现 `NaN` 或空白。
+ * 注意与输入态的区别：用户在输入框里清空得到的是 `''`，写进 store 的是 `0`，
+ * 因此这里把「空值」视为缺失、把数字字符串视为有效数字。
+ *
+ * @param {unknown} raw configStore 快照里的原始值
+ * @returns {number} 0..3600 的整数
+ */
+function readCompletionMinSeconds(raw) {
+  if (raw === undefined || raw === null) return COMPLETION_MIN_FALLBACK;
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? clampCompletionMinSeconds(raw) : COMPLETION_MIN_FALLBACK;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return COMPLETION_MIN_FALLBACK;
+    const numeric = Number(trimmed);
+    return Number.isFinite(numeric) ? clampCompletionMinSeconds(numeric) : COMPLETION_MIN_FALLBACK;
+  }
+  return COMPLETION_MIN_FALLBACK;
+}
+
+/**
  * 归一化整份配置；缺失/损坏字段回落到默认值，保证渲染不崩。
  *
  * @param {unknown} raw 来自 configStore 的快照
- * @returns {{ enabled: boolean, backgroundSessions: boolean, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
+ * @returns {{ enabled: boolean, backgroundSessions: boolean, completionMinSeconds: number, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
  */
 function normalizeConfig(raw) {
   const value = raw && typeof raw === 'object' ? raw : {};
@@ -213,6 +276,7 @@ function normalizeConfig(raw) {
     enabled: typeof value.enabled === 'boolean' ? value.enabled : FALLBACK_CONFIG.enabled,
     backgroundSessions:
       typeof value.backgroundSessions === 'boolean' ? value.backgroundSessions : FALLBACK_CONFIG.backgroundSessions,
+    completionMinSeconds: readCompletionMinSeconds(value.completionMinSeconds),
     kinds,
   };
 }
@@ -393,6 +457,11 @@ export function ChimeSettings(props) {
   const [drafts, setDrafts] = useState({});
   /** 每个音效的行内错误文字（试听失败等）。 */
   const [errors, setErrors] = useState({});
+  /**
+   * 「最短任务时长」输入框的草稿（保留用户输入的原始文本，避免输入中间态被
+   * store 回写打断）；`undefined` 表示未编辑，直接显示 store 里的规范值。
+   */
+  const [completionDraft, setCompletionDraft] = useState(undefined);
 
   // store 采纳了草稿（或外部改动与草稿一致）后清掉草稿，让快照重新成为唯一事实来源。
   useEffect(() => {
@@ -481,6 +550,24 @@ export function ChimeSettings(props) {
     }
   };
 
+  /**
+   * 「最短任务时长」变化（顶层字段 `completionMinSeconds`，只作用于「完成」音效）。
+   *
+   * 输入框里保留用户原文当草稿，写进 store 的永远是钳制后的整数：
+   * 空串/非数字/负数/NaN → `0`（= 关闭门槛），超过 3600 → `3600`。
+   * 输入过程中不强行改写输入框内容（例如先打 `1` 再打 `5` 不会被 `1` 卡住），
+   * 失焦时才收起草稿、显示规范值 —— 与现有输入框的草稿策略一致。
+   *
+   * @param {string} text number 输入框的原始字符串
+   */
+  const onCompletionMinChange = (text) => {
+    setCompletionDraft(String(text));
+    updateConfig({ completionMinSeconds: clampCompletionMinSeconds(text) });
+  };
+
+  /** 失焦：收起草稿，输入框改为显示 store 里的规范值。 */
+  const onCompletionMinBlur = () => setCompletionDraft(undefined);
+
   /** 清掉某个音效的输入框草稿（store 成为唯一事实来源）。 */
   const dropDraft = (kind) => {
     setDrafts((previous) => {
@@ -563,6 +650,9 @@ export function ChimeSettings(props) {
         const configured = current.src.trim().length > 0;
         const error = errors[kind] || '';
         const percent = Math.round(current.volume * 100);
+        // 只服务于「完成」卡片：优先显示输入草稿，否则显示 store 里的规范值。
+        const completionDisplay =
+          completionDraft !== undefined ? completionDraft : String(config.completionMinSeconds);
 
         return (
           <section key={kind} style={styles.card}>
@@ -605,6 +695,31 @@ export function ChimeSettings(props) {
                 {tt('clear')}
               </button>
             </div>
+
+            {kind === 'completed' ? (
+              <div style={styles.completionMin}>
+                <div style={styles.row}>
+                  <label style={styles.volumeLabel} htmlFor="dsh-chime-completion-min">
+                    {tt('completionMinLabel')}
+                  </label>
+                  <input
+                    id="dsh-chime-completion-min"
+                    type="number"
+                    style={styles.numberInput}
+                    min="0"
+                    max="3600"
+                    step="1"
+                    inputMode="numeric"
+                    value={completionDisplay}
+                    aria-label={tt('completionMinLabel')}
+                    onChange={(event) => onCompletionMinChange(event.target.value)}
+                    onBlur={onCompletionMinBlur}
+                  />
+                  <span style={styles.hint}>{tt('completionMinUnit')}</span>
+                </div>
+                <p style={styles.hint}>{tt('completionMinHint')}</p>
+              </div>
+            ) : null}
 
             {error ? <p style={styles.error}>{error}</p> : null}
           </section>

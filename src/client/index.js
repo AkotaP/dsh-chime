@@ -131,6 +131,24 @@ export function apply(ctx) {
         return null;
       }
     },
+    getLastUserMessageTime: (sessionId) => {
+      // The completion gate measures how long the task has run. Its start is
+      // the newest `user/message` in the session log: approvals and answers do
+      // not produce that event, so waiting for a human never resets the timer.
+      // `null` means "unknown", which the detector treats as "ring anyway".
+      try {
+        const entries = ctx.get('sessions')?.binding?.(sessionId)?.eventSource
+          ?.getSnapshot?.()?.entries;
+        if (!Array.isArray(entries)) return null;
+        for (let index = entries.length - 1; index >= 0; index -= 1) {
+          const event = entries[index]?.event;
+          if (event?.type === 'user/message' && Number.isFinite(event.time)) return event.time;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
     countActiveJobs: async (sessionId) => jobs.count(sessionId),
     onChime: ({ kind }) => {
       const config = configStore.getSnapshot();
