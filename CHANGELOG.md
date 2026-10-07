@@ -6,6 +6,12 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.3.1] — not released
+
+### Fixed
+
+- **A console error on every poll: `cannot get property "remote.job" without inject`.** The background-job count called `ctx.remote.job.list(...)`, a namespace a plugin cannot reach — Typert rejects `remote.<namespace>` without an explicit inject, and the client `jobs` service already wraps that namespace. The count now subscribes with `ctx.jobs.watchRows(sessionId)` and reads `ctx.jobs.state.rowsBySession`, which is how the official job list does it. The service is looked up optionally and every access is guarded, so a DSH without it degrades to a count of 0 instead of erroring. `tools/verify-apply.mjs` now activates the plugin twice — with and without the `jobs` service — to keep that degradation path honest.
+
 ## [0.3.0] — not released
 
 ### Added

@@ -79,6 +79,10 @@ const services = {
     register() { return noop; },
     bind() { return (key) => key; },
   },
+  jobs: {
+    state: { getSnapshot: () => ({ rowsBySession: new Map() }), subscribe: () => noop },
+    watchRows() { return noop; },
+  },
   sessions: {
     list: { getSnapshot: () => ({ ids: [], byId: {}, phase: 'ready' }), subscribe: () => noop },
     binding: () => undefined,
@@ -115,6 +119,18 @@ try {
   console.log('apply()        : FAILED');
   console.log('  message      :', error && error.message);
   console.log('  stack        :', String(error && error.stack).split('\n').slice(0, 6).join('\n                  '));
+  process.exit(1);
+}
+
+// Degradation: an older DSH without the `jobs` service must still activate —
+// the roster count simply stays 0 instead of throwing.
+delete services.jobs;
+try {
+  apply(ctx);
+  console.log('apply() w/o jobs: OK — degraded, count stays 0');
+} catch (error) {
+  console.log('apply() w/o jobs: FAILED');
+  console.log('  message        :', error && error.message);
   process.exit(1);
 }
 

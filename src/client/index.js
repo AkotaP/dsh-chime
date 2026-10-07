@@ -31,57 +31,77 @@ const PACKAGE_NAME = 'dsh-chime';
  *
  * `running === false` alone never means "finished": background bash jobs and
  * background subagents keep running while the agent loop is idle (see
- * CONTRACT §3.5). This mirrors `ctx.remote.job.list`, which streams the
- * session's visible job roster as whole-set frames.
+ * CONTRACT §3.5). The roster is reached through the client `jobs` service —
+ * `ctx.jobs.state` carries `rowsBySession`, which `ctx.jobs.watchRows()`
+ * populates per Session. (`ctx.remote.job` is **not** reachable from a plugin:
+ * Typert rejects `remote.<namespace>` without an explicit inject, and the
+ * `jobs` service already wraps that namespace.)
+ *
+ * The service is looked up optionally and every access is guarded: when it is
+ * unavailable the count simply stays 0, which degrades to "the completion
+ * chime may ring a little early" instead of breaking playback.
  *
  * @param {object} ctx - Client root context.
  * @returns {{count: (sessionId: string) => number, dispose: () => void}} counter.
  */
 function createJobCounter(ctx) {
-  /** @type {Map<string, number>} latest active-job count per Session. */
-  const counts = new Map();
-  /** @type {Map<string, AbortController>} one watch per Session. */
+  /** @type {Map<string, unknown>} one roster subscription per Session. */
   const watches = new Map();
   let disposed = false;
 
-  /** Open the roster stream for one Session, once. */
+  /** @returns {object|undefined} the optional `jobs` client service. */
+  function jobsService() {
+    try {
+      if (ctx.jobs && typeof ctx.jobs === 'object') return ctx.jobs;
+    } catch {
+      // fall through to the lookup form
+    }
+    try {
+      const service = ctx.get('jobs');
+      return service && typeof service === 'object' ? service : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Subscribe once so the shared model starts tracking this Session's roster. */
   function watch(sessionId) {
     if (disposed || sessionId === undefined || watches.has(sessionId)) return;
-    const remote = ctx.get('remote');
-    if (remote?.job?.list === undefined) return;
-    const controller = new AbortController();
-    watches.set(sessionId, controller);
-    const consume = async () => {
-      try {
-        const frames = remote.job.list({ sessionId }, controller.signal);
-        for await (const frame of frames) {
-          if (frame?.type !== 'rows') continue;
-          counts.set(
-            sessionId,
-            (frame.jobs ?? []).filter(
-              (job) => job.status === 'running' || job.status === 'stopping',
-            ).length,
-          );
-        }
-      } catch {
-        // A failing roster stream must never break sound playback.
-      }
-    };
-    void consume();
+    const jobs = jobsService();
+    if (typeof jobs?.watchRows !== 'function') return;
+    try {
+      watches.set(sessionId, jobs.watchRows(sessionId));
+    } catch {
+      // An unavailable roster must never break sound playback.
+    }
+  }
+
+  /** Read the current count out of the shared model snapshot. */
+  function activeCount(sessionId) {
+    const jobs = jobsService();
+    const rows = jobs?.state?.getSnapshot?.()?.rowsBySession?.get?.(String(sessionId));
+    if (!Array.isArray(rows)) return 0;
+    return rows.filter((row) => row?.status === 'running' || row?.status === 'stopping').length;
   }
 
   return {
-    /** Current active-job count; opens the watch on first use. */
+    /** Current active-job count; opens the roster subscription on first use. */
     count(sessionId) {
       watch(sessionId);
-      return counts.get(sessionId) ?? 0;
+      return activeCount(sessionId);
     },
-    /** Stop every roster stream. */
+    /** Release every roster subscription. */
     dispose() {
       disposed = true;
-      for (const controller of watches.values()) controller.abort();
+      for (const release of watches.values()) {
+        try {
+          if (typeof release === 'function') release();
+          else if (typeof release?.release === 'function') release.release();
+        } catch {
+          // best effort
+        }
+      }
       watches.clear();
-      counts.clear();
     },
   };
 }
