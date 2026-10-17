@@ -9,7 +9,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { COMPLETION_DEBOUNCE_MS, MAX_SESSION_DEPTH, createDetector } from '../src/client/detect.js';
+import {
+  COMPLETION_DEBOUNCE_MS,
+  MAX_SESSION_DEPTH,
+  createDetector,
+  shouldDeliver,
+} from '../src/client/detect.js';
 
 /**
  * 假时钟：`setTimeout` 只在 `advance()` 时按时间顺序触发，`fireTimers: false`
@@ -76,7 +81,11 @@ function createHarness({ config = {}, deps = {}, fireTimers = true } = {}) {
   const clock = createClock({ fireTimers });
   const detector = createDetector({
     onChime: (event) => events.push(event),
-    getConfig: () => ({ backgroundSessions: false, enabled: true, ...config }),
+    getConfig: () => ({
+      enabled: true,
+      attention: { sound: 'current-only', notify: 'away-or-other' },
+      ...config,
+    }),
     now: clock.now,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
@@ -138,7 +147,7 @@ test('approval 上升沿只响一次，持续为 approval 不重复响；消失�
   const returned = h.detector.evaluate(pending(), list, new Map());
   assert.deepEqual(
     returned,
-    [{ kind: 'approval', sessionId: 's1', urgent: true }],
+    [{ kind: 'approval', sessionId: 's1', urgent: true, sound: true, notify: false }],
     'evaluate 的返回值应与 onChime 收到的事件一致',
   );
   h.detector.evaluate(pending(), list, new Map());
@@ -149,7 +158,7 @@ test('approval 上升沿只响一次，持续为 approval 不重复响；消失�
   h.detector.evaluate(statuses({ s1: st() }), list, new Map());
   h.detector.evaluate(pending(), list, new Map());
   assert.deepEqual(h.kinds(), ['approval', 'approval']);
-  assert.deepEqual(h.events[0], { kind: 'approval', sessionId: 's1', urgent: true });
+  assert.deepEqual(h.events[0], { kind: 'approval', sessionId: 's1', urgent: true, sound: true, notify: false });
 });
 
 test('question：question 与 plan-review 归为同一类，从无到有各算一次上升沿', () => {
@@ -469,8 +478,8 @@ test('等待审批/回答期间不响 completed（空闲但仍在等用户）', 
 // 多会话 / 配置
 // ---------------------------------------------------------------------------
 
-test('backgroundSessions=false：非激活会话一律不响', () => {
-  const h = createHarness({ config: { backgroundSessions: false } });
+test('current-only（默认）：非激活会话一律不响', () => {
+  const h = createHarness();
   const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
 
   h.detector.evaluate(
@@ -481,8 +490,8 @@ test('backgroundSessions=false：非激活会话一律不响', () => {
   assert.deepEqual(h.kinds(), []);
 });
 
-test('backgroundSessions=true：非激活会话照常响', () => {
-  const h = createHarness({ config: { backgroundSessions: true } });
+test('attention.sound=always：非激活会话照常响', () => {
+  const h = createHarness({ config: { attention: { sound: 'always' } } });
   const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
 
   h.detector.evaluate(
@@ -493,8 +502,8 @@ test('backgroundSessions=true：非激活会话照常响', () => {
   assert.deepEqual(h.kinds(), ['question']);
 });
 
-test('backgroundSessions=false：非激活会话落定也不响 completed', async () => {
-  const h = createHarness({ config: { backgroundSessions: false } });
+test('current-only：非激活会话落定也不响 completed', async () => {
+  const h = createHarness();
   const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
 
   h.detector.evaluate(statuses({ bg: st({ running: true }) }), list, new Map());
@@ -513,7 +522,7 @@ test('enabled=false 时全局静音，但状态照常推进（重新开启不会
 });
 
 test('多会话各自独立判定，同一 tick 互不影响', () => {
-  const h = createHarness({ config: { backgroundSessions: true } });
+  const h = createHarness({ config: { attention: { sound: 'always' } } });
   const list = listOf({
     ids: ['a', 'b'],
     rows: { a: mainRow('a'), b: bgRow('b') },
@@ -550,7 +559,7 @@ test('会话从列表消失（phase=ready）时清理状态，不会把旧状态
 // ---------------------------------------------------------------------------
 
 test('evaluate 容忍缺失的 statuses / 普通对象数据源 / job 数组', () => {
-  const h = createHarness({ config: { backgroundSessions: true } });
+  const h = createHarness({ config: { attention: { sound: 'always' } } });
   const list = listOf({ ids: ['s1'], rows: { s1: mainRow('s1') } });
 
   // statuses 传普通对象；activeJobs 传 job 视图数组（按 status 计数）
@@ -576,7 +585,7 @@ test('start() 轮询真实快照并判定；dispose() 清理定时器与状态',
     getStatuses: () => live,
     getSessionList: () => list,
     countActiveJobs: async () => jobCount,
-    getConfig: () => ({ backgroundSessions: false, enabled: true }),
+    getConfig: () => ({ enabled: true }),
     onChime: (event) => events.push(event),
     now: clock.now,
     setTimeout: clock.setTimeout,
@@ -614,6 +623,203 @@ test('start() 轮询真实快照并判定；dispose() 清理定时器与状态',
   await clock.advance(1000);
   await flush();
   assert.deepEqual(events.map((event) => event.kind), ['completed']);
+});
+
+// ---------------------------------------------------------------------------
+// poke()：事件驱动（后台标签页不依赖被节流的定时器）
+// ---------------------------------------------------------------------------
+
+test('poke() 由数据源变化驱动立即求值，不依赖轮询定时器', async () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const clock = createClock();
+  const live = new Map([['s1', st({ running: true })]]);
+  const events = [];
+
+  const detector = createDetector({
+    getStatuses: () => live,
+    getSessionList: () => soloList(),
+    countActiveJobs: async () => 0,
+    getConfig: () => ({ enabled: true }),
+    onChime: (event) => events.push(event),
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    // 轮询被刻意推到极远：本用例里出声只可能来自 poke()。
+    pollMs: 100000,
+    onError: () => {},
+  });
+
+  const stop = detector.start();
+  await flush(); // 初始 tick：观察到 running
+  assert.deepEqual(events, [], '仅 running 不产生事件');
+
+  // 提问上升沿：不推进假时钟，只 poke。
+  live.set('s1', st({ pendingInteraction: { kind: 'question' } }));
+  detector.poke();
+  await flush();
+  assert.deepEqual(events.map((event) => event.kind), ['question'], 'poke() 后必须立刻求值');
+
+  // 上升沿只响一次：同一状态再 poke 不得重复。
+  detector.poke();
+  await flush();
+  assert.deepEqual(events.map((event) => event.kind), ['question']);
+
+  stop();
+  assert.equal(clock.pending(), 0, 'dispose 后不得留下任何定时器');
+});
+
+test('poke() 在 tick 进行中合并为一次补跑，dispose 后失效', async () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const clock = createClock();
+  let listCalls = 0;
+  let releaseJob;
+  const jobGate = new Promise((resolve) => {
+    releaseJob = resolve;
+  });
+
+  const detector = createDetector({
+    getStatuses: () => new Map([['s1', st({ running: true })]]),
+    getSessionList: () => {
+      listCalls += 1;
+      return soloList();
+    },
+    countActiveJobs: () => jobGate,
+    getConfig: () => ({ enabled: true }),
+    onChime: () => {},
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    onError: () => {},
+  });
+
+  detector.poke(); // 第 1 次 tick：卡在 countActiveJobs
+  await flush();
+  assert.equal(listCalls, 1);
+
+  detector.poke(); // tick 进行中：只有一次补跑名额
+  detector.poke();
+  detector.poke();
+  await flush();
+  assert.equal(listCalls, 1, '进行中的 tick 不得重入');
+
+  releaseJob(0);
+  await flush();
+  await flush();
+  assert.equal(listCalls, 2, '补跑恰好一次，事件不被丢掉也不会堆成队列');
+
+  detector.dispose();
+  detector.poke();
+  await flush();
+  assert.equal(listCalls, 2, 'dispose 之后 poke() 是空操作');
+});
+
+// ---------------------------------------------------------------------------
+// 两条通道：sound（音效）与 notify（系统通知，CONTRACT §4.7）
+// ---------------------------------------------------------------------------
+
+test('notify 关闭（默认）时非激活会话根本不产出事件——与旧的 audible 判定等价', () => {
+  const h = createHarness();
+  const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
+
+  const returned = h.detector.evaluate(
+    statuses({ bg: st({ pendingInteraction: { kind: 'approval' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(returned, [], '通知没开，非激活会话不该产出事件');
+});
+
+test('notify.enabled=true：非激活会话照样产出事件，但 sound=false（只通知、不出声）', () => {
+  const h = createHarness({
+    config: { notify: { enabled: true } },
+  });
+  const list = listOf({ ids: ['bg'], rows: { bg: bgRow('bg') } });
+
+  const returned = h.detector.evaluate(
+    statuses({ bg: st({ pendingInteraction: { kind: 'approval' } }) }),
+    list,
+    new Map(),
+  );
+  assert.deepEqual(
+    returned,
+    [{ kind: 'approval', sessionId: 'bg', urgent: true, sound: false, notify: true }],
+    '两条通道各有各的提醒时机：音效不响，通知该发出去',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 提醒时机（CONTRACT §3.7）：会话维度 × 窗口焦点维度
+// ---------------------------------------------------------------------------
+
+test('shouldDeliver：五档策略的完整真值表', () => {
+  /** @type {Array<[string, boolean, boolean, boolean]>} */
+  const cases = [
+    ['current-only', true, true, true],
+    ['current-only', true, false, true],
+    ['current-only', false, true, false],
+    ['current-only', false, false, false],
+    ['away', true, true, false],
+    ['away', true, false, true],
+    ['away', false, true, false],
+    ['away', false, false, true],
+    ['away-or-other', true, true, false],
+    ['away-or-other', true, false, true],
+    ['away-or-other', false, true, true],
+    ['away-or-other', false, false, true],
+    ['always', true, true, true],
+    ['always', false, false, true],
+    ['never', true, true, false],
+    ['never', false, false, false],
+  ];
+  for (const [policy, isActive, focused, expected] of cases) {
+    assert.equal(
+      shouldDeliver(policy, isActive, focused),
+      expected,
+      policy + ' · 当前会话=' + isActive + ' · 聚焦=' + focused,
+    );
+  }
+
+  // 配置损坏 / 老数据：未知策略按历史默认 current-only 处理，行为依旧可预期。
+  assert.equal(shouldDeliver('bogus', true, true), true);
+  assert.equal(shouldDeliver(undefined, false, true), false);
+});
+
+test('attention.sound=away：聚焦时不响，失焦才响', () => {
+  const focus = { value: true };
+  const h = createHarness({
+    config: { attention: { sound: 'away' } },
+    deps: { isFocused: () => focus.value },
+  });
+  const list = soloList();
+  const approval = () => statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) });
+
+  h.detector.evaluate(approval(), list, new Map());
+  assert.deepEqual(h.kinds(), [], '聚焦时不该响');
+
+  focus.value = false;
+  h.detector.evaluate(statuses({ s1: st() }), list, new Map());
+  h.detector.evaluate(approval(), list, new Map());
+  assert.deepEqual(h.kinds(), ['approval'], '失焦后该响');
+});
+
+test('isFocused 抛错时不炸、按「在场」处理', () => {
+  const h = createHarness({
+    config: { attention: { sound: 'away' } },
+    deps: {
+      isFocused: () => {
+        throw new Error('focus boom');
+      },
+    },
+  });
+
+  assert.doesNotThrow(() =>
+    h.detector.evaluate(
+      statuses({ s1: st({ pendingInteraction: { kind: 'approval' } }) }),
+      soloList(),
+      new Map(),
+    ),
+  );
+  assert.deepEqual(h.kinds(), [], 'away + 视为在场 → 不响，且全程没有抛错');
 });
 
 test('evaluate 在 dispose 之后是空操作', () => {

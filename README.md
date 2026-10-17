@@ -17,9 +17,11 @@ DSH（DeepSeek Harness）Web 通知音效插件。
 
 - **链接式音源** —— 插件**不复制**你的音频文件：
   - 粘贴 `http(s)` 网络链接，或
-  - 粘贴本地音频文件的**完整路径**（如 `E:\Sounds\ding.mp3`），由插件的 host half 暴露成**同源 URL** 播放。
+  - 粘贴本地音频文件的**完整路径**（Linux/macOS 如 `/home/you/ding.mp3`，Windows 如 `E:\Sounds\ding.mp3`），由插件的 host half 暴露成**同源 URL** 播放。
 - **每个音效独立音量**：0–100 独立调节，互不影响。
-- **多会话开关**：默认只有当前激活的会话会发声；打开「背景会话也响」后，后台会话的事件也会响。
+- **提醒时机可选**：同时看「事情发生在哪个会话」和「你此刻在不在 DSH」两个维度，共五档 —— 只看当前会话 / 只在我不在时 / 我不在或事情在别的会话（推荐）/ 总是 / 从不。音效与通知各自选档，但共用同一套判定。
+- **后台也响**：窗口切到后台、或者一挂二十分钟，事件一到就响，不用等你切回来。
+- **系统通知（独立开关）**：事件发生时弹一条桌面通知，Windows / macOS / Linux 都走系统通知中心。它与音效是两条独立通道，提醒时机单独设置。
 - **不误报**：后台 bash 任务、后台子代理仍在运行时不会误报「完成」；会被自动重试的失败不会触发「中断」。
 - **默认静音**：没配置的音效不会响，也不会退回到内置提示音。
 
@@ -63,6 +65,8 @@ dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime
 - **为什么走 host 路由读本地文件**：DSH 的 Client Remote 面**没有 mount `workspaceFiles`**，原生目录选择器又只支持选目录、不支持列目录。把本地文件通过 DSH 自己的 HTTP 服务暴露成**同源 URL**，浏览器就会当普通资源处理 —— 不落盘、不复制，也不受 Remote 通道限制。
 - **播放走 Web Audio**（`AudioContext` + `decodeAudioData` + `BufferSource` + `GainNode`）。
   插件会在首次 `pointerdown`/`keydown` 解锁 `AudioContext`，之后自动播放才被允许。
+- **事件驱动为主、轮询兜底**：订阅 DSH 的 `uiSession.sessionStatus` 与 `sessions.list`，状态一变立即判定，窗口回到前台时再补一次；400ms 轮询只当保险丝。后台页面会被节流 —— 隐藏标签页的 `setTimeout` 被拉长到秒级甚至更粗（浏览器里开着「内存节省」还可能直接冻结标签页），纯轮询会让「提问 / 审批」音效压到你切回 DSH 才响。订阅走 DSH 的 remote 推送，不经过定时器，所以窗口藏在后台照样即时。
+- **通知是第二条独立通道**：只认 `config.notify`（总开关 + 逐类开关），走浏览器的 `Notification`，每条固定 `silent: true`（声音归音效管，否则会「双响」）。首次要在设置页点一次「授权」—— 浏览器要求权限请求落在用户手势里；环境不支持或权限被拒时静默降级，不报错。
 - **事件判定**参考 DSH 自身的侧边栏状态机：`running` 只表示 agent loop 在跑，**不等于**任务结束，所以「完成」用复合判定（见 [`CONTRACT.md`](./CONTRACT.md) §3）。
 
 ## 开发
@@ -70,7 +74,7 @@ dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime
 ```bash
 pnpm install
 node build.mjs                 # 产出 lib/index.js 与 lib/client.js
-node test/detect.test.mjs      # 27 个事件判定用例
+node test/detect.test.mjs      # 43 个事件判定用例
 node tools/verify-apply.mjs    # 用 stub context 真正执行一次 apply()
 node tools/verify-host-routes.mjs
 ```

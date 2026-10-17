@@ -1,7 +1,7 @@
 /**
  * dsh-chime host half：把本地音频文件暴露成**同源 HTTP 资源**。
  *
- * 为什么需要 host half：主人环境里两条 client Remote 通道都不可用
+ * 为什么需要 host half：实际环境里两条 client Remote 通道都不可用
  * （`uiWorkspace.listDirectory` → `directory-picker/unavailable`，
  * `ctx.remote.workspaceFiles` 在旧 web profile 上未挂载）。而 `dsh-host-webserver`
  * 的命名路由 `handler` 是**直接调用、不经过鉴权拦截**的

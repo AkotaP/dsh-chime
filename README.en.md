@@ -17,9 +17,11 @@ A DeepSeek Harness (DSH) **web** plugin for per-event notification chimes.
 
 - **Link-based sources** — the plugin never copies your audio files:
   - an `http(s)` link, or
-  - the **full path** to a local audio file (e.g. `E:\Sounds\ding.mp3`), served by the plugin's own host half as a **same-origin URL**.
+  - the **full path** to a local audio file (e.g. `/home/you/ding.mp3` on Linux/macOS, `E:\Sounds\ding.mp3` on Windows), served by the plugin's own host half as a **same-origin URL**.
 - **Per-chime volume** — 0–100, fully independent.
-- **Background-session switch** — off by default, so only the session you are looking at rings.
+- **Attention timing** — five policies over two dimensions at once: which session the event came from, and whether the DSH window has focus. Current session only / only when I am away / away or another session (recommended) / always / never. Sound and notifications pick independently but share one judgement.
+- **Rings from the background** — with the window hidden or parked for twenty minutes, a chime fires the moment the event lands instead of waiting for you to switch back.
+- **System notifications (independent switch)** — a desktop notification per event, through the system notification centre on Windows, macOS and Linux. It is a second, independent channel with its own timing policy.
 - **No false positives** — background bash jobs or subagents still running never trigger "completion", and retried failures never trigger "interruption".
 - **Silent by default** — an unconfigured chime stays silent; there is never a built-in fallback tone.
 
@@ -63,6 +65,8 @@ After installing, **restart DSH**; the **Chime** card on the Plugins page shows 
   - `GET /dsh-chime/list?path=<directory>` — directory entries (currently unused; that entry point is parked)
 - **Why the host route reads local files**: DSH's Client Remote surface does **not** mount `workspaceFiles`, and the native directory picker can select a directory but not list one. Exposing the file through DSH's own HTTP server turns it into a **same-origin URL** the browser treats like any other resource — nothing is copied to disk, and no Remote channel is involved.
 - Playback uses **Web Audio** (`AudioContext` + `decodeAudioData` + `BufferSource` + `GainNode`). The plugin unlocks its `AudioContext` on the first `pointerdown`/`keydown`, after which automatic playback is allowed.
+- **Event-driven first, polling as a fallback**: the plugin subscribes to DSH's `uiSession.sessionStatus` and `sessions.list`, evaluates the moment either changes, and evaluates once more when the window returns to the foreground; the 400 ms poll is only a safety net. Background pages get throttled — a hidden tab's `setTimeout` is stretched to a second or more, and Chrome's Memory Saver can freeze such a tab outright — so a poll-only detector could hold a "question" or "approval" chime back until you switched back to DSH. The subscriptions ride DSH's remote channel and never touch a timer.
+- **Notifications are a second, independent channel**: they read only `config.notify` (master switch + per-event toggles), go through the browser's `Notification`, and are always `silent: true` — sound belongs to the chime channel, or you would hear two tones. The first use needs one "Allow" click in the settings form, because browsers require the permission prompt to come from a user gesture; unsupported or denied environments degrade to silence without errors.
 - Event detection mirrors DSH's own sidebar state machine. In particular, `running` only means the agent loop is busy — it does **not** mean the task is finished — so "completion" uses a composite test (see [`CONTRACT.md`](./CONTRACT.md) §3).
 
 ## Development
@@ -70,7 +74,7 @@ After installing, **restart DSH**; the **Chime** card on the Plugins page shows 
 ```bash
 pnpm install
 node build.mjs                 # emits lib/index.js and lib/client.js
-node test/detect.test.mjs      # 27 event-detection cases
+node test/detect.test.mjs      # 43 event-detection cases
 node tools/verify-apply.mjs    # activates the client half against a stub context
 node tools/verify-host-routes.mjs
 ```

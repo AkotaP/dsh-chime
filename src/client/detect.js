@@ -9,7 +9,9 @@
  * 核心设计：
  * - `evaluate(statuses, list, activeJobs)` 是**数据驱动的单步求值**：只读入参、
  *   内部 per-session 状态和注入的依赖函数，不读任何全局状态，可直接喂假数据单测。
- *   `start()` 只负责把真实快照喂给同一个 `evaluate`。
+ *   `start()` 只负责把真实快照喂给同一个 `evaluate`；`poke()` 是**事件驱动**入口，
+ *   数据源（`sessionStatus` / `sessions.list`）一变就立刻求值，不必等轮询定时器 ——
+ *   后台标签页里浏览器会把定时器节流到秒级甚至分钟级，而 DSH 的 remote 推送不走定时器。
  * - 只做**上升沿**触发；同一会话同一 tick 只产出优先级最高的一个事件（§3.1）。
  * - `interrupted` 只认 `lastAgentError`：错误出现后，必须等到该会话确实不在跑
  *   （`running === false`）时才响；重试期间的瞬时错误（running 仍为 true，
@@ -18,7 +20,10 @@
  * - `completed` 另有一道**最短任务时长门槛**：距该会话最后一条用户消息不足
  *   `config.completionMinSeconds` 秒就不响，避免小任务频繁响铃。门槛只决定
  *   「这一次响不响」，不参与内部状态推进；拿不到时间戳或配置没给该字段时**照响**
- *   （主人指定的回落方向：宁可多响，绝不静默）。
+ *   （约定的回落方向：宁可多响，绝不静默）。
+ * - `sound` 字段把「要不要出声」交给消费方：音效与系统通知是两条独立通道，事件本身
+ *   只报告「这条值得提醒用户」，具体怎么提醒由 `index.js` 按各自的配置决定
+ *   （音效看 `enabled` / 音源，通知看 `notify`；两条通道再各自按 `attention` 档位判定时机）。
  * - 还有一道**全局深度门槛**（`config.maxDepth`）：按会话在子对话树里的深度决定
  *   是否发声，`0` 只允许主对话，`1` 再允许直接子代理，依此类推。**四类事件都适用**。
  *   深度取自 `getSessionList().byId[id].parentSessionId` 的父链，按会话缓存、只在
@@ -38,6 +43,43 @@ export const DEFAULT_POLL_MS = 400;
  * 真实子对话树远达不到这个深度。
  */
 export const MAX_SESSION_DEPTH = 32;
+
+/**
+ * 提醒时机策略判定（CONTRACT §3.7）。
+ *
+ * | 策略 | 当前会话·聚焦 | 当前会话·失焦 | 其他会话·聚焦 | 其他会话·失焦 |
+ * |---|---|---|---|---|
+ * | `current-only` | 送达 | 送达 | — | — |
+ * | `away` | — | 送达 | — | 送达 |
+ * | `away-or-other` | — | 送达 | 送达 | 送达 |
+ * | `always` | 一律送达 |
+ * | `never` | 一律不送 |
+ *
+ * 音效与通知各选一档，但走的是同一个函数、同一份在场感 —— 这是刻意的：Codex 桌面端
+ * 出过「系统通知声音关了、插件提示音照响」的错位，共用判定就不会有这个问题。
+ *
+ * 未知取值一律按 `current-only`（历史默认）处理，配置损坏时行为依然可预期。
+ *
+ * @param {unknown} policy 策略取值。
+ * @param {boolean} isActiveSession 事件是否来自当前正在看的会话。
+ * @param {boolean} focused 窗口此刻是否拥有焦点。
+ * @returns {boolean} 是否应当送达。
+ */
+export function shouldDeliver(policy, isActiveSession, focused) {
+  switch (policy) {
+    case 'always':
+      return true;
+    case 'never':
+      return false;
+    case 'away':
+      return !focused;
+    case 'away-or-other':
+      return !focused || !isActiveSession;
+    case 'current-only':
+    default:
+      return isActiveSession;
+  }
+}
 
 /** 视为「活跃后台 job」的状态（job 计数由调用方计算，此处仅用于容错入参）。 */
 const ACTIVE_JOB_STATUSES = new Set(['running', 'stopping']);
@@ -59,6 +101,7 @@ const EMPTY_LIST = Object.freeze({
  * @property {'approval' | 'question' | 'interrupted' | 'completed'} kind 事件种类。
  * @property {string} sessionId 触发事件的会话 id。
  * @property {boolean} [urgent] 是否需要用户立刻注意（当前仅 `approval` 为 true）。
+ * @property {boolean} sound 当前配置下这条事件是否应当播放音效；`false` 表示只发系统通知。
  */
 
 /**
@@ -215,17 +258,18 @@ function readActiveJobs(activeJobs, id) {
  * @param {() => any} [deps.getSessionList] 取 `sessions.list` 快照。
  * @param {(sessionId: string) => Promise<number>} [deps.countActiveJobs] 取某会话活跃 job 数。
  * @param {(event: ChimeEvent) => void} [deps.onChime] 命中事件时回调。
- * @param {() => any} [deps.getConfig] 取配置快照（读 `enabled` / `backgroundSessions` / `completionMinSeconds` / `maxDepth`）。
+ * @param {() => any} [deps.getConfig] 取配置快照（读 `enabled` / `attention` / `notify` / `completionMinSeconds` / `maxDepth`）。
  * @param {(sessionId: string) => (string | null | undefined)} [deps.getAgentError] 可选：直接读最终错误。
  * @param {(sessionId: string) => any} [deps.getSessionSnapshot] 可选：读 `SessionSnapshot`。
  * @param {(sessionId: string) => (number | null | undefined)} [deps.getLastUserMessageTime] 可选：读该会话最后一条用户消息的时间戳（毫秒，与 `now` 同源）。
+ * @param {() => boolean} [deps.isFocused] 可选：窗口此刻是否拥有焦点（默认 `() => true`，即视为在场）。
  * @param {() => number} [deps.now] 可选：当前时间戳。
  * @param {(fn: () => void, ms: number) => unknown} [deps.setTimeout] 可选：定时器。
  * @param {(handle: unknown) => void} [deps.clearTimeout] 可选：取消定时器。
  * @param {number} [deps.debounceMs] 可选：完成防抖窗口。
  * @param {number} [deps.pollMs] 可选：`start()` 轮询间隔。
  * @param {(error: unknown, where: string) => void} [deps.onError] 可选：错误上报。
- * @returns {{ start: () => () => void, evaluate: (statuses: unknown, list: any, activeJobs: unknown) => ChimeEvent[], dispose: () => void }} 判定器。
+ * @returns {{ start: () => () => void, poke: () => void, evaluate: (statuses: unknown, list: any, activeJobs: unknown) => ChimeEvent[], dispose: () => void }} 判定器。
  */
 export function createDetector(deps) {
   const {
@@ -237,6 +281,7 @@ export function createDetector(deps) {
     getAgentError = null,
     getSessionSnapshot = null,
     getLastUserMessageTime = null,
+    isFocused = () => true,
     now = () => Date.now(),
     setTimeout: schedule = (fn, ms) => setTimeout(fn, ms),
     clearTimeout: cancel = (handle) => clearTimeout(handle),
@@ -271,6 +316,8 @@ export function createDetector(deps) {
   let ticking = false;
   /** @type {unknown} */
   let pollHandle = null;
+  /** tick 进行中又收到的事件只记一次补跑，避免事件风暴把求值堆成队列。 */
+  let pendingTick = false;
 
   /** @param {unknown} error 错误。 @param {string} where 位置。 */
   function report(error, where) {
@@ -408,7 +455,7 @@ export function createDetector(deps) {
     // 门槛关闭 / 配置没给该字段（NaN）→ 照响。
     if (!Number.isFinite(min) || min <= 0) return false;
     const startedAt = lastUserMessageTimeFor(id);
-    // 拿不到用户消息时间戳 → 照响（主人指定的回落方向）。
+    // 拿不到用户消息时间戳 → 照响（约定的回落方向）。
     if (!Number.isFinite(startedAt)) return false;
     return nowMs - startedAt < min * 1000;
   }
@@ -517,7 +564,6 @@ export function createDetector(deps) {
       config = {};
     }
     const enabled = config.enabled !== false;
-    const backgroundSessions = config.backgroundSessions === true;
     const nowMs = now();
     /** @type {ChimeEvent[]} */
     const emitted = [];
@@ -537,7 +583,23 @@ export function createDetector(deps) {
       // 列表里查不到该会话时（例如启动期 `list.phase === 'pending'`）无法证明它是
       // 背景会话，按「激活」处理，避免漏掉主会话的第一次审批。
       const isActiveSession = row === undefined || (row.retainedBy?.mainView ?? 0) > 0;
-      const audible = enabled && (backgroundSessions || isActiveSession);
+      // 提醒时机（CONTRACT §3.7）：音效与通知是两条**独立**通道，各按自己的策略判定
+      // 「此刻要不要打扰」。两者的策略都建立在同一份在场感（窗口焦点）与同一个
+      // 「事件是否来自当前会话」之上 —— 共用信号，所以不会出现 Codex 那种
+      // 「通知关了、声音还在响」的错位。
+      let focused = true;
+      try {
+        focused = isFocused() === true;
+      } catch (error) {
+        // 拿不到焦点：按「在场」处理（宁可多提醒，绝不因读不到而静默）。
+        report(error, 'isFocused');
+      }
+      const sound = enabled && shouldDeliver(config.attention?.sound, isActiveSession, focused);
+      const wantsNotify =
+        config.notify?.enabled === true &&
+        shouldDeliver(config.attention?.notify, isActiveSession, focused);
+      // 两条通道都不需要时，这条事件根本不必产出。
+      const reportable = sound || wantsNotify;
 
       // 1) 记录活跃事实：completed 必须建立在「曾经活跃」之上，防止初始状态误触发（§3.5）。
       if (activeWork) state.seenActive = true;
@@ -586,8 +648,8 @@ export function createDetector(deps) {
               : null;
       if (kind === null) continue;
 
-      // 非激活会话 / 总开关关闭时不出声；状态照常推进，避免解禁后补响旧事件。
-      if (!audible) continue;
+      // 音效与通知都不需要时静默；状态照常推进，避免解禁后补响旧事件。
+      if (!reportable) continue;
 
       // completed 的最短任务时长门槛：只决定「这一次响不响」。
       // 上面的状态推进（seenActive 复位、取消防抖）已经完成，所以短任务既不补响，
@@ -599,7 +661,7 @@ export function createDetector(deps) {
       if (depthTooDeep(sessionList, id, config)) continue;
 
       /** @type {ChimeEvent} */
-      const event = { kind, sessionId: id, urgent: kind === 'approval' };
+      const event = { kind, sessionId: id, urgent: kind === 'approval', sound, notify: wantsNotify };
       emitted.push(event);
       try {
         onChime(event);
@@ -649,15 +711,22 @@ export function createDetector(deps) {
     return new Map(jobCounts);
   }
 
-  /** 下一次轮询。 */
+  /** 安排下一次轮询（同一时间只保留一条轮询链）。 */
   function scheduleNextPoll() {
-    if (disposed || !started) return;
-    pollHandle = schedule(() => tick(), pollMs);
+    if (disposed || !started || pollHandle !== null) return;
+    pollHandle = schedule(() => {
+      pollHandle = null;
+      void tick();
+    }, pollMs);
   }
 
-  /** 拉取真实快照并求值一次。 */
+  /** 拉取真实快照并求值一次；进行中再次调用会记一次补跑。 */
   async function tick() {
-    if (disposed || ticking) return;
+    if (disposed) return;
+    if (ticking) {
+      pendingTick = true;
+      return;
+    }
     ticking = true;
     try {
       const list = getSessionList() ?? EMPTY_LIST;
@@ -672,8 +741,24 @@ export function createDetector(deps) {
       report(error, 'tick');
     } finally {
       ticking = false;
+      const again = pendingTick;
+      pendingTick = false;
       scheduleNextPoll();
+      // 补跑排在轮询之后：期间到来的事件不会被丢掉，也不会堆出多条轮询链。
+      if (again && !disposed) void tick();
     }
+  }
+
+  /**
+   * 事件驱动入口：数据源变化时请求一次**立即**求值（CONTRACT §4.4）。
+   *
+   * 订阅 `uiSession.sessionStatus` / `sessions.list` 后调用它，后台标签页也能即时
+   * 发声 —— 浏览器节流的是定时器，不是 remote 推送的回调。tick 进行中重复调用只会
+   * 合并成一次补跑；`dispose()` 之后是空操作。
+   */
+  function poke() {
+    if (disposed) return;
+    void tick();
   }
 
   /**
@@ -705,8 +790,9 @@ export function createDetector(deps) {
       states.clear();
       jobCounts.clear();
       depthCache.clear();
+      pendingTick = false;
     }
   }
 
-  return { start, evaluate, dispose };
+  return { start, poke, evaluate, dispose };
 }

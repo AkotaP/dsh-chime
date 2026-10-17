@@ -208,8 +208,40 @@ status.pendingInteraction?.kind === 'question' || === 'plan-review'
 
 ### 3.6 多会话
 
-- `sessionId` 是否为"当前激活会话"：`sessions.list.byId[id].retainedBy.mainView > 0`。
-- 若配置 `backgroundSessions === false`（默认建议 false），**非激活会话一律不响**。
+- `sessionId` 是否为「当前激活会话」：`sessions.list.byId[id].retainedBy.mainView > 0`。
+- 这个维度只是提醒判定的一半，另一半是窗口焦点 —— 见 §3.7。
+
+### 3.7 提醒时机（音效与通知共用的一套判定）
+
+> 依据：Codex 桌面端通知系统的调研。Codex 只判断「窗口是否聚焦」，而它自己的 Issue 也承认
+> 漏掉了「事件来自哪条对话」；本插件两个维度都判。
+
+提醒的送达由**两个维度**决定，音效与通知**各选一档**，但**共用同一份判定**：
+
+| 维度 | 来源 |
+|---|---|
+| 事件是否来自当前会话 | `sessions.list.byId[id].retainedBy.mainView > 0` |
+| 窗口此刻是否拥有焦点 | `document.hasFocus()`（`presence.js`；被其他窗口遮挡时它同样为 false） |
+
+五档策略（`ATTENTION_POLICIES`）：
+
+| 策略 | 当前会话·聚焦 | 当前会话·失焦 | 其他会话·聚焦 | 其他会话·失焦 |
+|---|---|---|---|---|
+| `current-only` | 送达 | 送达 | — | — |
+| `away` | — | 送达 | — | 送达 |
+| `away-or-other` | — | 送达 | 送达 | 送达 |
+| `always` | 一律送达 | | | |
+| `never` | 一律不送 | | | |
+
+要求：
+
+- 判定实现在 `detect.js` 导出的纯函数 `shouldDeliver(policy, isActiveSession, focused)`，可直接单测；
+  未知取值一律按历史默认 `current-only` 处理，配置损坏时行为仍可预期。
+- **任何一步读不到都按「在场」处理**（`document` 不可用、`hasFocus()` 抛错、依赖缺失）：
+  宁可多提醒一次，绝不因为读不到焦点而静默。
+- `completionMinSeconds` 与 `maxDepth` 两道既有门槛依旧独立生效，且对两条通道一视同仁。
+- 音效与通知共用同一个函数、同一份在场感是**刻意的**：Codex 桌面端出过「系统通知关了声、
+  提示音照响」的错位，共用判定就不会有这个问题。
 - 注意 DSH 的 `completionUnread` 只对非主会话置位（证据 `.probe/ui-session-client.js:314-321`），可作参考但**不要直接依赖它**，因为主会话永远为 false。
 
 ---
@@ -229,8 +261,17 @@ export const DEFAULT_CHIME = { src: '', volume: 0.8, source: 'url' };
 // source: 'url' | 'file'
 
 export const DEFAULT_CONFIG = {
-  backgroundSessions: false,      // 背景会话是否也响
-  enabled: true,                  // 总开关
+  attention: {                    // 提醒时机：会话维度 × 窗口焦点维度（§3.7）
+    sound: 'current-only',        // 音效：只看当前会话（历史行为）
+    notify: 'away-or-other',      // 通知：我不在、或事情在别的会话
+  },
+  completionMinSeconds: 10,       // 「完成」的最短任务时长（秒）；0 = 总是响
+  enabled: true,                  // 音效总开关
+  maxDepth: 0,                    // 最深发声的会话层级；0 = 只有主对话
+  notify: {                       // 系统通知：独立于音效的第二条通道（§4.7）
+    enabled: false,               // 通知总开关
+    kinds: { approval: true, question: true, interrupted: true, completed: true },
+  },
   kinds: {
     approval:    { src: '', volume: 0.8, source: 'url' },
     question:    { src: '', volume: 0.8, source: 'url' },
@@ -328,8 +369,10 @@ export const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'
  */
 export function createDetector(deps) {
   return {
-    /** 开始监听；返回 dispose */
+    /** 开始监听（轮询兜底）；返回 dispose */
     start(),
+    /** 事件驱动：数据源变化时请求一次立即求值；tick 进行中只合并为一次补跑 */
+    poke(),
     /** 单次求值（测试用，可注入假数据） */
     evaluate(statuses, list, activeJobs),
     dispose(),
@@ -341,6 +384,11 @@ export function createDetector(deps) {
 - 内部维护 per-session 的上一次状态快照，只做**上升沿**触发。
 - 实现 §3 全部规则，特别是 §3.5 的复合判定与防抖、§3.4 的重试排除。
 - **`evaluate(...)` 必须是纯函数式的单步求值**，便于单测（用假数据直接跑）。
+- **`poke()` 必须绕开定时器**：`index.js` 订阅 `uiSession.sessionStatus` / `sessions.list` 后调用它，后台标签页（定时器被浏览器节流甚至冻结）也要能即时发声。tick 进行中重复调用只合并成一次补跑；`dispose()` 之后是空操作。
+- 轮询（`start()` 的 `pollMs`）只作**兜底**，不得成为唯一的求值路径。
+- 事件带 `sound: boolean` 与 `notify: boolean`，分别是两条通道的结论（判定见 §3.7）：
+  `true` = 按该通道自己的策略，这条应当送达。音效看 `enabled` + 音源，通知看 `notify.enabled` +
+  `notify.kinds[kind]`；两条通道都不需要时，这条事件根本不产出。
 
 ### 4.5 `settings.jsx`（owner: settings-ui）
 
@@ -349,18 +397,66 @@ export function ChimeSettings(props); // slot 组件，view 由 index.js 决定
 export function ChimeSummary(props);  // 卡片摘要（view === 'summary'）
 ```
 
-UI 内容：
-- 总开关
-- 「背景会话也响」开关
-- 四个音效各一行：标签 + 链接输入框（URL 或绝对路径）+「浏览…」按钮 + 音量滑块（0-100）+「试听」按钮
-- 未配置时输入框为空、显示"未设置（不响）"
-- 保存：直接写入 config store（live 生效，不需要独立"保存"按钮）
+UI 内容。**卡片顺序即优先级：通道 → 通用规则 → 事件**：
 
-依赖注入：组件通过 props 接收 `{ t, configStore, audioEngine, fileBrowser }`，**不要直接 import**（便于测试与解耦）。
+1. **音效**：总开关 + 音效提醒时机（§3.7 的五档下拉）
+2. **系统通知**：总开关 + 通知提醒时机（同一个下拉）+ 权限三态与「授权」按钮
+3. **通用配置**：最深响应的对话层级 + 最短任务时长 —— 两条通道共用的安静规则（§3.7）
+4. **每一类事件一张卡片**（权限审批 / 回答问题 / 中断 / 完成）：
+   标签与说明 + 音源输入框（URL 或绝对路径）+ 音量滑块（0-100）+「试听」/「清除」
+   + 「也发系统通知」勾选（写 `notify.kinds[kind]`）+ 该类专属的「测试通知」按钮
+
+- 未配置音源时输入框为空、显示「未设置（不响）」，「试听」/「清除」随之禁用。
+- 通知总开关未打开时，事件卡片上的勾选**仍可配置**，只是旁边提示「暂时不生效」——
+  配置与启用是两件事，不因为它没开就禁止用户先配好。
+- 保存：直接写入 config store（live 生效，不需要独立「保存」按钮）。
+
+依赖注入：组件通过 props 接收 `{ t, configStore, audioEngine, notifier, fileBrowser }`，**不要直接 import**（便于测试与解耦）。
 
 ### 4.6 `index.js`（owner: **Lead**）
 
 组装全部模块、注册 slot、启动 detector。**由 Lead 独占，其他人不要改。**
+
+### 4.7 `notify.js`（owner: notify）
+
+```js
+/**
+ * @param {object} [deps]
+ * @param {() => Config} [deps.getConfig]                    读 `notify.enabled` / `notify.kinds`
+ * @param {typeof Notification} [deps.NotificationCtor]      可注入（默认全局 `Notification`），便于单测
+ * @param {(event) => {title: string, body?: string}} [deps.buildMessage] 本地化文案
+ * @param {() => void} [deps.onClick]                         点击通知的回调（把窗口拉到前台）
+ */
+export function createNotifier(deps) {
+  return {
+    supported(),            // () => boolean
+    permission(),           // () => 'unsupported' | 'default' | 'granted' | 'denied'
+    requestPermission(),    // () => Promise<同三态>，**必须在用户手势里调用**
+    explain(event),         // (ChimeEvent) => { ok, reason }，**只预检不弹**：报告卡在哪一步
+    notify(event),          // (ChimeEvent) => boolean，是否真的弹出
+    dispose(),
+  };
+}
+```
+
+要求：
+
+- **只认 `config` 里的 notify 那一份**：总开关 `enabled`、逐类 `kinds[kind]`，再加上它自己的
+  提醒时机 `attention.notify`（§3.7）。音效总开关关着、音源留空都不影响通知 —— 两条通道互不牵连。
+- 判定顺序：总开关 → 逐类开关 → 环境支持 → 权限已授予 → 构造成功；
+  **任何一步失败都只返回 `false`，绝不抛错**。
+- 每条通知固定 `silent: true`：声音归音效通道管，避免系统提示音与自定义音效叠成「双响」。
+- `tag` 形如 `dsh-chime:<kind>:<会话 id>`，**总长必须 ≤ 48 字符**（id 过长时只保留尾部）：
+  同一会话的同类事件互相替换，不在通知中心堆成一串。⚠️ 这条上限不是随手定的 —— **Windows
+  toast 的 `Tag` 属性封顶 64 字符，超长会被 Chromium 整条静默丢弃**（构造函数照样成功、
+  `error` 事件都不发、既不弹横幅也不进通知中心）。DSH 的 `session-<uuid>` 拼上前缀正好 64
+  字符，这是实测踩出来的坑，`test/notify.test.mjs` 有回归用例钉住。
+- 点击时关闭自己并回调 `onClick`（`index.js` 用它把窗口拉到前台）。
+- 环境不支持（`Notification` 不存在，例如 Node 侧）时 `supported() === false`、`notify()` 恒 `false`。
+- `explain(event)` 走与 `notify()` **完全相同**的判定链，但**不真的弹**，只返回原因码：
+  `ready` / `disabled` / `kind-off` / `unsupported` / `permission-<state>` / `config-error` /
+  `unknown-kind` / `disposed`。设置页的「测试通知」按钮用它把「点了没反应」变成一句明确的原因；
+  `test/notify.test.mjs` 有一条用例专门钉住「两者结论永远一致」。
 
 ---
 

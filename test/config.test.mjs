@@ -42,12 +42,13 @@ test('every top-level default field can actually be updated', () => {
     const fields = Object.keys(DEFAULT_CONFIG).sort();
     assert.deepEqual(
       fields,
-      ['backgroundSessions', 'completionMinSeconds', 'enabled', 'kinds', 'maxDepth'],
+      ['attention', 'completionMinSeconds', 'enabled', 'kinds', 'maxDepth', 'notify'],
       'DEFAULT_CONFIG gained a field — extend configsEqual and this test, or the field will be silently unupdatable',
     );
 
     for (const field of fields) {
-      if (field === 'kinds') continue;
+      // 对象型字段（attention / kinds / notify）由各自的专项用例覆盖，这里只跑标量。
+      if (field === 'kinds' || field === 'notify' || field === 'attention') continue;
       const store = createConfigStore();
       const before = store.getSnapshot()[field];
       const next = typeof before === 'boolean' ? !before : before + 1;
@@ -58,6 +59,73 @@ test('every top-level default field can actually be updated', () => {
         `update({ ${field}: ... }) did not change the snapshot`,
       );
     }
+  });
+});
+
+test('attention：两路档位都能写进去，且互不干扰（configsEqual 覆盖了 attention）', () => {
+  withStorage(() => {
+    const store = createConfigStore();
+    const before = store.getSnapshot().attention;
+
+    store.update({ attention: { ...before, sound: 'away' } });
+    assert.equal(store.getSnapshot().attention.sound, 'away');
+    assert.equal(store.getSnapshot().attention.notify, before.notify, '改一路不该动另一路');
+
+    store.update({ attention: { ...store.getSnapshot().attention, notify: 'never' } });
+    assert.equal(store.getSnapshot().attention.notify, 'never');
+
+    // 非法取值回落默认，而不是把整份配置写坏。
+    store.update({ attention: { sound: 'bogus', notify: 'nope' } });
+    assert.equal(store.getSnapshot().attention.sound, DEFAULT_CONFIG.attention.sound);
+    assert.equal(store.getSnapshot().attention.notify, DEFAULT_CONFIG.attention.notify);
+  });
+});
+
+test('老配置的 backgroundSessions 折算进 attention.sound，且不再写出', () => {
+  const KEY = 'dsh.chime.config.v1';
+
+  withStorage((backing) => {
+    backing.set(KEY, JSON.stringify({ enabled: true, backgroundSessions: true }));
+    const on = createConfigStore();
+    assert.equal(on.getSnapshot().attention.sound, 'always', 'true 应折算成 always');
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(on.getSnapshot(), 'backgroundSessions'),
+      false,
+      '旧字段不该再出现在快照里',
+    );
+  });
+
+  withStorage((backing) => {
+    backing.set(KEY, JSON.stringify({ enabled: true, backgroundSessions: false }));
+    const off = createConfigStore();
+    assert.equal(off.getSnapshot().attention.sound, 'current-only', 'false 应折算成 current-only');
+    assert.equal(off.getSnapshot().attention.notify, DEFAULT_CONFIG.attention.notify);
+  });
+});
+
+test('notify 的总开关与逐类开关都真的能写进去（configsEqual 覆盖了 notify）', () => {
+  withStorage(() => {
+    const store = createConfigStore();
+
+    store.update({ notify: { ...store.getSnapshot().notify, enabled: true } });
+    assert.equal(
+      store.getSnapshot().notify.enabled,
+      true,
+      'update({ notify.enabled }) 被 commit 丢掉了——configsEqual 没比较 notify',
+    );
+
+    const kinds = { ...store.getSnapshot().notify.kinds, completed: false };
+    store.update({ notify: { ...store.getSnapshot().notify, kinds } });
+    assert.equal(
+      store.getSnapshot().notify.kinds.completed,
+      false,
+      'update({ notify.kinds }) 被 commit 丢掉了——configsEqual 没比较 notify.kinds',
+    );
+
+    // 归一化容错：notify 整体损坏时回落默认形状，而不是把整份配置变成 undefined。
+    store.update({ notify: 'garbage' });
+    assert.equal(store.getSnapshot().notify.enabled, DEFAULT_CONFIG.notify.enabled);
+    assert.deepEqual(store.getSnapshot().notify.kinds, DEFAULT_CONFIG.notify.kinds);
   });
 });
 

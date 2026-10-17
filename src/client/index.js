@@ -18,6 +18,8 @@ import { createFileBrowser, toPlayableUrl } from './assets.js';
 import * as localAudioStore from './localAudioStore.js';
 import { NS as LOCALE_NS, zh as localeZh, en as localeEn } from './locale.js';
 import { createDetector } from './detect.js';
+import { createNotifier } from './notify.js';
+import { createPresence } from './presence.js';
 import { ChimeSettings, ChimeSummary } from './settings.jsx';
 
 /** Hard dependencies resolved before `apply` runs. */
@@ -107,6 +109,71 @@ function createJobCounter(ctx) {
 }
 
 /**
+ * 生成通知文案用的翻译函数。
+ *
+ * 与 `settings.jsx` 的 `translate` 同一策略：优先 `locale.bind(NS)`；`t` 缺失 /
+ * 抛错 / 返回空串 / 原样返回 key 时回落到 `locale.js` 的 `zh` 字典，最后才原样
+ * 显示 key —— 任何路径都不会渲染出空白。
+ *
+ * @param {object|undefined} locale `ctx.locale`（可能不可用）。
+ * @returns {(key: string) => string} 取文案。
+ */
+function createTranslator(locale) {
+  /** @type {((key: string) => string)|null} */
+  let bound = null;
+  try {
+    if (typeof locale?.bind === 'function') bound = locale.bind(LOCALE_NS);
+  } catch {
+    bound = null;
+  }
+  return (key) => {
+    try {
+      if (typeof bound === 'function') {
+        const value = bound(key);
+        if (typeof value === 'string' && value.length > 0 && value !== key) return value;
+      }
+    } catch {
+      // 绑定失效：回落字典。
+    }
+    const fallback = localeZh[key];
+    return typeof fallback === 'string' && fallback.length > 0 ? fallback : key;
+  };
+}
+
+/**
+ * 取某个会话的标题，用作通知正文；拿不到时返回空串，由调用方改用通用文案。
+ *
+ * @param {object} ctx Client 根 Context。
+ * @param {unknown} sessionId 会话 id。
+ * @returns {string} 标题（可能为空串）。
+ */
+function sessionTitleOf(ctx, sessionId) {
+  try {
+    const row = ctx.get('sessions')?.list?.getSnapshot?.()?.byId?.[sessionId];
+    const title = row?.title ?? row?.name;
+    return typeof title === 'string' ? title.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 把 `{name}` 占位替换为参数。
+ *
+ * 与 `settings.jsx` 的 `format()` 同一策略：`locale` 的 `t` 只按 key 取值、不带参数，
+ * 占位统一在这里填；缺参数时保留原样，不会渲染出 `undefined`。
+ *
+ * @param {string} template 文案模板。
+ * @param {Record<string, unknown>} params 占位参数。
+ * @returns {string} 填充后的文案。
+ */
+function fillTemplate(template, params) {
+  return String(template).replace(/\{(\w+)\}/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : match,
+  );
+}
+
+/**
  * Install the chime feature on one Client context.
  *
  * @param {object} ctx - Client root context.
@@ -133,8 +200,40 @@ export function apply(ctx) {
     resolveSource: (src, source, kind) => toPlayableUrl(src, source, kind),
   });
 
+  /** 通知文案用的翻译函数（bind → zh 字典 → key 本身）。 */
+  const text = createTranslator(locale);
+
+  // 在场感（CONTRACT §3.7）：音效与通知共用同一份「窗口在不在焦点」信号，
+  // 避免 Codex 桌面端那种「通知关了、声音还在响」的错位。
+  const presence = createPresence();
+
+  // 系统通知：与音效**独立**的第二条通道（CONTRACT §4.7）。它只认 config.notify，
+  // 所以音效总开关关着、音源留空，通知照样弹。
+  const notifier = createNotifier({
+    getConfig: () => configStore.getSnapshot(),
+    buildMessage: (event) => {
+      const title = text(`notify_kind_${event.kind}_title`);
+      // 有会话标题时，正文明确写成「来自会话 ——「xxx」」：多会话并行时一眼看出是哪条对话，
+      // 也避免一串裸文本看着像乱入。拿不到标题才退回该类事件的通用说明。
+      const sessionTitle = sessionTitleOf(ctx, event.sessionId);
+      const body = sessionTitle
+        ? fillTemplate(text('notifyBodyFromSession'), { session: sessionTitle })
+        : text(`notify_kind_${event.kind}_body`);
+      return { title, body };
+    },
+    onClick: () => {
+      // 点了通知就把 DSH 窗口拉到前台（浏览器可能忽略，静默失败即可）。
+      try {
+        globalThis.focus?.();
+      } catch {
+        // best effort
+      }
+    },
+  });
+
   const detector = createDetector({
     getConfig: () => configStore.getSnapshot(),
+    isFocused: () => presence.focused(),
     getStatuses: () => {
       const uiSession = ctx.get('uiSession');
       return uiSession?.sessionStatus?.getSnapshot?.() ?? new Map();
@@ -170,9 +269,14 @@ export function apply(ctx) {
       }
     },
     countActiveJobs: async (sessionId) => jobs.count(sessionId),
-    onChime: ({ kind }) => {
+    onChime: (event) => {
+      const { kind } = event;
       const config = configStore.getSnapshot();
-      if (!config.enabled) return;
+      // 通知：detect 已按 notify 通道自己的策略（总开关 + 逐类开关 + 提醒时机）算好
+      // `event.notify`，这里不再重复判定，也不受音效开关与音源配置影响。
+      if (event.notify === true) notifier.notify(event);
+      // 音效：`event.sound` 同理是 detect 的结论；`config.enabled` 只作兜底。
+      if (event.sound === false || !config.enabled) return;
       const entry = config.kinds?.[kind];
       // Unset sound means silence — never fall back to a built-in tone.
       if (entry === undefined || entry.src === '') return;
@@ -182,9 +286,44 @@ export function apply(ctx) {
 
   ctx.effect(() => {
     const stop = detector.start();
+
+    // Event-driven nudge (CONTRACT §4.4 `poke`). DSH pushes status and list
+    // changes over its remote channel; those callbacks are not timers, so they
+    // keep firing in a background tab where the poll above is throttled down to
+    // seconds — or stops entirely once the browser freezes the tab.
+    /** @type {Array<() => void>} */
+    const releases = [];
+    /** @param {() => any} resolve 取得可订阅数据源。 */
+    const follow = (resolve) => {
+      try {
+        const release = resolve()?.subscribe?.(() => detector.poke());
+        if (typeof release === 'function') releases.push(release);
+      } catch {
+        // A missing or unserializable source must never break activation.
+      }
+    };
+    follow(() => ctx.get('uiSession')?.sessionStatus);
+    follow(() => ctx.get('sessions')?.list);
+
+    // Returning to the foreground settles whatever happened while hidden,
+    // without waiting for the next poll tick.
+    const onVisibilityChange = () => {
+      detector.poke();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
     return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      for (const release of releases) {
+        try {
+          release();
+        } catch {
+          // best effort
+        }
+      }
       if (typeof stop === 'function') stop();
       detector.dispose();
+      notifier.dispose();
       jobs.dispose();
       audio.dispose();
       localAudioStore.releaseAll();
@@ -224,6 +363,7 @@ export function apply(ctx) {
     return createElement(ChimeSettings, {
       ...shared,
       audioEngine: audio,
+      notifier,
       fileBrowser,
       localAudioStore,
     });

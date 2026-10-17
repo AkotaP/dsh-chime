@@ -52,12 +52,31 @@ const MAX_DEPTH_FALLBACK = 0;
 /** 最深响应层级的允许上限（层）；超出一律钳到该值。 */
 const MAX_DEPTH_MAX = 16;
 
+/**
+ * 提醒时机策略顺序，与 CONTRACT §3.7 的 `ATTENTION_POLICIES` 保持一致
+ * （本文件刻意不从 config.js import，只依赖契约签名）。
+ */
+const ATTENTION_POLICY_ORDER = ['current-only', 'away', 'away-or-other', 'always', 'never'];
+
+/** 通知配置的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG.notify`。 */
+const FALLBACK_NOTIFY = {
+  enabled: false,
+  kinds: { approval: true, question: true, interrupted: true, completed: true },
+};
+
+/** 提醒时机的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG.attention`。 */
+const FALLBACK_ATTENTION = {
+  sound: 'current-only',
+  notify: 'away-or-other',
+};
+
 /** 整体配置的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG`。 */
 const FALLBACK_CONFIG = {
   enabled: true,
-  backgroundSessions: false,
+  attention: FALLBACK_ATTENTION,
   completionMinSeconds: COMPLETION_MIN_FALLBACK,
   maxDepth: MAX_DEPTH_FALLBACK,
+  notify: FALLBACK_NOTIFY,
   kinds: {
     approval: { ...FALLBACK_KIND },
     question: { ...FALLBACK_KIND },
@@ -175,6 +194,29 @@ const styles = {
     display: 'flex',
     flexDirection: 'column',
     gap: '4px',
+  },
+  select: {
+    padding: '5px 8px',
+    borderRadius: '6px',
+    border: '1px solid rgba(127, 127, 127, 0.35)',
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    fontSize: '12px',
+    maxWidth: '260px',
+    // 折叠态跟随 DSH 主题；展开的原生弹层由系统绘制，由下面的 option 兜底。
+    colorScheme: 'light dark',
+  },
+  /**
+   * 展开后的原生下拉项。
+   *
+   * 这里**不能**写 `inherit`：弹出列表由系统绘制，从 `select` 继承来的浅色文字会落在
+   * 系统的浅色背景上，变成「白底浅字」而看不清。`Canvas` / `CanvasText` 是系统颜色
+   * 关键字，随系统深浅色联动，至少保证任何主题组合下前景与背景是配对可读的。
+   */
+  option: {
+    background: 'Canvas',
+    color: 'CanvasText',
   },
   numberInput: {
     width: '92px',
@@ -312,22 +354,51 @@ function readMaxDepth(raw) {
 }
 
 /**
+ * 归一化单个提醒时机策略；未知/缺失回落默认。
+ *
+ * @param {unknown} value 原始值
+ * @param {string} fallback 默认策略
+ * @returns {string} 合法策略
+ */
+function normalizePolicy(value, fallback) {
+  return typeof value === 'string' && ATTENTION_POLICY_ORDER.includes(value) ? value : fallback;
+}
+
+/**
  * 归一化整份配置；缺失/损坏字段回落到默认值，保证渲染不崩。
  *
+ * `attention` 是本版本新字段：老配置的 `backgroundSessions` 在这里折算进 `sound`
+ * （`true → always`、`false → current-only`），折算后不再写出。
+ *
  * @param {unknown} raw 来自 configStore 的快照
- * @returns {{ enabled: boolean, backgroundSessions: boolean, completionMinSeconds: number, maxDepth: number, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
+ * @returns {{ enabled: boolean, attention: { sound: string, notify: string }, completionMinSeconds: number, maxDepth: number, notify: { enabled: boolean, kinds: Record<string, boolean> }, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
  */
 function normalizeConfig(raw) {
   const value = raw && typeof raw === 'object' ? raw : {};
   const rawKinds = value.kinds && typeof value.kinds === 'object' ? value.kinds : {};
   const kinds = {};
   for (const kind of KIND_ORDER) kinds[kind] = normalizeKind(rawKinds[kind]);
+  const rawNotify = value.notify && typeof value.notify === 'object' ? value.notify : {};
+  const rawNotifyKinds = rawNotify.kinds && typeof rawNotify.kinds === 'object' ? rawNotify.kinds : {};
+  const notifyKinds = {};
+  for (const kind of KIND_ORDER) {
+    notifyKinds[kind] =
+      typeof rawNotifyKinds[kind] === 'boolean' ? rawNotifyKinds[kind] : FALLBACK_NOTIFY.kinds[kind];
+  }
+  const rawAttention = value.attention && typeof value.attention === 'object' ? value.attention : {};
+  const legacySound = value.backgroundSessions === true ? 'always' : FALLBACK_ATTENTION.sound;
   return {
     enabled: typeof value.enabled === 'boolean' ? value.enabled : FALLBACK_CONFIG.enabled,
-    backgroundSessions:
-      typeof value.backgroundSessions === 'boolean' ? value.backgroundSessions : FALLBACK_CONFIG.backgroundSessions,
+    attention: {
+      sound: normalizePolicy(rawAttention.sound, legacySound),
+      notify: normalizePolicy(rawAttention.notify, FALLBACK_ATTENTION.notify),
+    },
     completionMinSeconds: readCompletionMinSeconds(value.completionMinSeconds),
     maxDepth: readMaxDepth(value.maxDepth),
+    notify: {
+      enabled: typeof rawNotify.enabled === 'boolean' ? rawNotify.enabled : FALLBACK_NOTIFY.enabled,
+      kinds: notifyKinds,
+    },
     kinds,
   };
 }
@@ -490,6 +561,60 @@ function useConfigSnapshot(configStore) {
   return config;
 }
 
+/** 通知权限三态 → 文案 key；未知取值按「不支持」显示。 */
+const PERMISSION_TEXT_KEYS = {
+  default: 'notifyPermissionDefault',
+  granted: 'notifyPermissionGranted',
+  denied: 'notifyPermissionDenied',
+  unsupported: 'notifyPermissionUnsupported',
+};
+
+/** 「测试通知」原因码 → 文案 key。 */
+const TEST_REASON_KEYS = {
+  ready: 'notifyTestReady',
+  disabled: 'notifyTestDisabled',
+  'kind-off': 'notifyTestKindOff',
+  unsupported: 'notifyTestUnsupported',
+  'config-error': 'notifyTestConfigError',
+  'unknown-kind': 'notifyTestUnknownKind',
+  disposed: 'notifyTestDisposed',
+};
+
+/**
+ * 把 `notifier.explain()` 的原因码翻成一句人话。
+ *
+ * @param {(key: string, params?: object) => string} tt 翻译函数
+ * @param {string} reason 原因码
+ * @returns {string} 可直接显示的文案
+ */
+function testReasonText(tt, reason) {
+  if (Object.prototype.hasOwnProperty.call(TEST_REASON_KEYS, reason)) {
+    return tt(TEST_REASON_KEYS[reason]);
+  }
+  if (typeof reason === 'string' && reason.startsWith('permission-')) {
+    return tt('notifyTestPermission', { state: reason.slice('permission-'.length) });
+  }
+  return tt('notifyTestConfigError');
+}
+
+/**
+ * 读当前通知权限；`notifier` 缺失或抛错时按「不支持」处理。
+ *
+ * @param {{ permission?: Function } | undefined} notifier
+ * @returns {'default'|'granted'|'denied'|'unsupported'}
+ */
+function readPermission(notifier) {
+  try {
+    if (notifier && typeof notifier.permission === 'function') {
+      const value = notifier.permission();
+      if (typeof value === 'string') return value;
+    }
+  } catch {
+    /* 权限查询失败：当作不支持 */
+  }
+  return 'unsupported';
+}
+
 /**
  * 完整配置表单（`view === 'page'`）。
  *
@@ -497,10 +622,11 @@ function useConfigSnapshot(configStore) {
  * @param {(key: string) => string} [props.t] locale 翻译函数，缺失用中文兜底
  * @param {{ getSnapshot: Function, subscribe: Function, update: Function, setKind: Function }} [props.configStore]
  * @param {{ preview?: Function, setVolume?: Function }} [props.audioEngine]
+ * @param {{ permission?: Function, requestPermission?: Function }} [props.notifier] 通知模块（CONTRACT §4.7）
  * @returns {import('react').ReactElement}
  */
 export function ChimeSettings(props) {
-  const { t, configStore, audioEngine } = props || {};
+  const { t, configStore, audioEngine, notifier } = props || {};
   const tt = useTranslator(t);
   const config = useConfigSnapshot(configStore);
 
@@ -517,6 +643,19 @@ export function ChimeSettings(props) {
   const [maxDepthDraft, setMaxDepthDraft] = useState(undefined);
   /** 最深层级输入框的显示值：草稿优先，否则显示 store 里的规范值。 */
   const maxDepthDisplay = maxDepthDraft !== undefined ? maxDepthDraft : String(config.maxDepth);
+  /** 「最短任务时长」输入框的显示值：草稿优先，否则显示 store 里的规范值。 */
+  const completionDisplay =
+    completionDraft !== undefined ? completionDraft : String(config.completionMinSeconds);
+  /** 系统通知的权限三态；`requestPermission()` 成功/失败后都会重新读一次。 */
+  const [permission, setPermission] = useState(() => readPermission(notifier));
+  /** 权限请求进行中（按钮转文案 + 防重复点击）。 */
+  const [requesting, setRequesting] = useState(false);
+  /** 每张事件卡片「测试通知」的结论文案；缺 key 表示还没点过。 */
+  const [testResults, setTestResults] = useState({});
+
+  useEffect(() => {
+    setPermission(readPermission(notifier));
+  }, [notifier]);
 
   // store 采纳了草稿（或外部改动与草稿一致）后清掉草稿，让快照重新成为唯一事实来源。
   useEffect(() => {
@@ -640,6 +779,96 @@ export function ChimeSettings(props) {
   /** 失焦：收起草稿，输入框改为显示 store 里的规范值。 */
   const onMaxDepthBlur = () => setMaxDepthDraft(undefined);
 
+  /**
+   * 立即写入提醒时机。
+   *
+   * `attention` 是顶层字段，而 `configStore.update` 只做浅合并 —— 所以必须整体展开写回，
+   * 否则另一条通道（音效 / 通知）的档位会被顺手抹掉。
+   *
+   * @param {'sound'|'notify'} channel 通道
+   * @param {string} policy 策略
+   */
+  const updateAttention = useCallback(
+    (channel, policy) => {
+      updateConfig({ attention: { ...config.attention, [channel]: policy } });
+    },
+    [config.attention, updateConfig],
+  );
+
+  /**
+   * 立即写入通知配置。
+   *
+   * `configStore.update` 是顶层浅合并，所以这里必须把整个 `notify` 对象展开写回，
+   * 否则 `kinds` 会被丢掉。
+   *
+   * @param {object} patch 要覆盖的通知字段
+   */
+  const updateNotify = useCallback(
+    (patch) => {
+      updateConfig({ notify: { ...config.notify, ...patch } });
+    },
+    [config.notify, updateConfig],
+  );
+
+  /**
+   * 切换某一类事件是否弹通知。
+   *
+   * @param {string} kind 事件种类
+   * @param {boolean} enabled 是否通知
+   */
+  const updateNotifyKind = (kind, enabled) => {
+    updateNotify({ kinds: { ...config.notify.kinds, [kind]: enabled } });
+  };
+
+  /**
+   * 「授权」按钮：必须在用户手势里调用 `requestPermission()`。
+   *
+   * 无论成功、失败还是返回未知值，最后都重新读一次真实权限，保证界面显示的是
+   * 系统的事实而不是我们的猜测。
+   */
+  const onRequestPermission = async () => {
+    if (!notifier || typeof notifier.requestPermission !== 'function') {
+      setPermission('unsupported');
+      return;
+    }
+    setRequesting(true);
+    try {
+      await notifier.requestPermission();
+    } catch {
+      /* 请求被拒也不影响界面：下面照常重读权限 */
+    } finally {
+      setRequesting(false);
+      setPermission(readPermission(notifier));
+    }
+  };
+
+  /**
+   * 「测试通知」：为某一类事件真的弹一条，并把结论摆在按钮旁边。
+   *
+   * 先问 `explain()` 卡在哪一步，只有全通过才真的发 —— 这样「点了没反应」永远不会
+   * 只是一个沉默，而是一句明确的话。
+   *
+   * @param {string} kind 事件种类
+   */
+  const onTestNotification = (kind) => {
+    const event = { kind, sessionId: '__dsh-chime-test__' };
+    let reason = 'ready';
+    try {
+      if (notifier && typeof notifier.explain === 'function') {
+        const check = notifier.explain(event);
+        if (check && typeof check.reason === 'string') reason = check.reason;
+      } else if (!notifier || typeof notifier.notify !== 'function') {
+        reason = 'unsupported';
+      }
+      if (reason === 'ready' && notifier && typeof notifier.notify === 'function') {
+        notifier.notify(event);
+      }
+    } catch {
+      reason = 'config-error';
+    }
+    setTestResults((previous) => ({ ...previous, [kind]: testReasonText(tt, reason) }));
+  };
+
   /** 清掉某个音效的输入框草稿（store 成为唯一事实来源）。 */
   const dropDraft = (kind) => {
     setDrafts((previous) => {
@@ -703,16 +932,103 @@ export function ChimeSettings(props) {
           />
           <span style={styles.kindLabel}>{tt('enabled')}</span>
         </label>
+        <div style={styles.completionMin}>
+          <div style={styles.row}>
+            <label style={styles.volumeLabel} htmlFor="dsh-chime-attention-sound">
+              {tt('attentionSoundLabel')}
+            </label>
+            <select
+              id="dsh-chime-attention-sound"
+              style={styles.select}
+              value={config.attention.sound}
+              aria-label={tt('attentionSoundLabel')}
+              onChange={(event) => updateAttention('sound', event.target.value)}
+            >
+              {ATTENTION_POLICY_ORDER.map((policy) => (
+                <option key={policy} value={policy} style={styles.option}>
+                  {tt('policy_' + policy.replace(/-/g, '_'))}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p style={styles.hint}>
+            {tt('policy_' + config.attention.sound.replace(/-/g, '_') + '_hint')}
+          </p>
+        </div>
+
+        {config.enabled ? null : <p style={styles.hint}>{tt('enabledHint')}</p>}
+      </section>
+
+      {/*
+        系统通知（CONTRACT §4.7）：与音效**独立**的一条通道。总开关、逐类开关、
+        权限三态都在这里 —— 音效那一区关着，也不会影响这一块工作。
+      */}
+      <section style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.kindLabel}>{tt('notifyTitle')}</span>
+        </div>
+
         <label style={styles.toggleRow}>
           <input
             type="checkbox"
             style={styles.checkbox}
-            checked={config.backgroundSessions}
-            onChange={(event) => updateConfig({ backgroundSessions: event.target.checked })}
+            checked={config.notify.enabled}
+            onChange={(event) => updateNotify({ enabled: event.target.checked })}
           />
-          <span>{tt('backgroundSessions')}</span>
+          <span>{tt('notifyEnable')}</span>
         </label>
-        <p style={styles.hint}>{tt('backgroundSessionsHint')}</p>
+        <p style={styles.hint}>{tt('notifyHint')}</p>
+
+        <div style={styles.completionMin}>
+          <div style={styles.row}>
+            <label style={styles.volumeLabel} htmlFor="dsh-chime-attention-notify">
+              {tt('attentionNotifyLabel')}
+            </label>
+            <select
+              id="dsh-chime-attention-notify"
+              style={styles.select}
+              value={config.attention.notify}
+              aria-label={tt('attentionNotifyLabel')}
+              onChange={(event) => updateAttention('notify', event.target.value)}
+            >
+              {ATTENTION_POLICY_ORDER.map((policy) => (
+                <option key={policy} value={policy} style={styles.option}>
+                  {tt('policy_' + policy.replace(/-/g, '_'))}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p style={styles.hint}>
+            {tt('policy_' + config.attention.notify.replace(/-/g, '_') + '_hint')}
+          </p>
+        </div>
+
+        <div style={styles.row}>
+          <span style={styles.hint}>
+            {tt(PERMISSION_TEXT_KEYS[permission] ?? PERMISSION_TEXT_KEYS.unsupported)}
+          </span>
+          {permission === 'default' ? (
+            <button
+              type="button"
+              style={styles.button}
+              disabled={requesting}
+              onClick={onRequestPermission}
+            >
+              {requesting ? tt('notifyRequesting') : tt('notifyRequest')}
+            </button>
+          ) : null}
+        </div>
+
+      </section>
+
+      {/*
+        通用配置：两条通道共用的「安静规则」。放在通道卡片之后、事件卡片之前，
+        因为它管的是「值不值得打扰」，与用哪条通道提醒无关（CONTRACT §3.7）。
+      */}
+      <section style={styles.card}>
+        <div style={styles.cardHead}>
+          <span style={styles.kindLabel}>{tt('configSectionTitle')}</span>
+        </div>
 
         <div style={styles.completionMin}>
           <div style={styles.row}>
@@ -737,7 +1053,28 @@ export function ChimeSettings(props) {
           <p style={styles.hint}>{tt('maxDepthHint')}</p>
         </div>
 
-        {config.enabled ? null : <p style={styles.hint}>{tt('enabledHint')}</p>}
+        <div style={styles.completionMin}>
+          <div style={styles.row}>
+            <label style={styles.volumeLabel} htmlFor="dsh-chime-completion-min">
+              {tt('completionMinLabel')}
+            </label>
+            <input
+              id="dsh-chime-completion-min"
+              type="number"
+              style={styles.numberInput}
+              min="0"
+              max="3600"
+              step="1"
+              inputMode="numeric"
+              value={completionDisplay}
+              aria-label={tt('completionMinLabel')}
+              onChange={(event) => onCompletionMinChange(event.target.value)}
+              onBlur={onCompletionMinBlur}
+            />
+            <span style={styles.hint}>{tt('completionMinUnit')}</span>
+          </div>
+          <p style={styles.hint}>{tt('completionMinHint')}</p>
+        </div>
       </section>
 
       {KIND_ORDER.map((kind) => {
@@ -746,10 +1083,6 @@ export function ChimeSettings(props) {
         const configured = current.src.trim().length > 0;
         const error = errors[kind] || '';
         const percent = Math.round(current.volume * 100);
-        // 只服务于「完成」卡片：优先显示输入草稿，否则显示 store 里的规范值。
-        const completionDisplay =
-          completionDraft !== undefined ? completionDraft : String(config.completionMinSeconds);
-
         return (
           <section key={kind} style={styles.card}>
             <div style={styles.cardHead}>
@@ -792,30 +1125,23 @@ export function ChimeSettings(props) {
               </button>
             </div>
 
-            {kind === 'completed' ? (
-              <div style={styles.completionMin}>
-                <div style={styles.row}>
-                  <label style={styles.volumeLabel} htmlFor="dsh-chime-completion-min">
-                    {tt('completionMinLabel')}
-                  </label>
-                  <input
-                    id="dsh-chime-completion-min"
-                    type="number"
-                    style={styles.numberInput}
-                    min="0"
-                    max="3600"
-                    step="1"
-                    inputMode="numeric"
-                    value={completionDisplay}
-                    aria-label={tt('completionMinLabel')}
-                    onChange={(event) => onCompletionMinChange(event.target.value)}
-                    onBlur={onCompletionMinBlur}
-                  />
-                  <span style={styles.hint}>{tt('completionMinUnit')}</span>
-                </div>
-                <p style={styles.hint}>{tt('completionMinHint')}</p>
-              </div>
-            ) : null}
+            <div style={styles.row}>
+              <label style={styles.volumeLabel}>
+                <input
+                  type="checkbox"
+                  style={styles.checkbox}
+                  checked={config.notify.kinds[kind]}
+                  onChange={(event) => updateNotifyKind(kind, event.target.checked)}
+                />
+                <span>{tt('notifyPerKind')}</span>
+              </label>
+              <span style={styles.spacer} />
+              <button type="button" style={styles.button} onClick={() => onTestNotification(kind)}>
+                {tt('notifyTest')}
+              </button>
+            </div>
+            {config.notify.enabled ? null : <p style={styles.hint}>{tt('notifyPerKindOff')}</p>}
+            {testResults[kind] ? <p style={styles.hint}>{testResults[kind]}</p> : null}
 
             {error ? <p style={styles.error}>{error}</p> : null}
           </section>
@@ -852,7 +1178,8 @@ export function ChimeSummary(props) {
         {config.enabled ? tt('summaryEnabled') : tt('summaryDisabled')}
         <span style={styles.summaryMuted}>
           {' · '}
-          {config.backgroundSessions ? tt('summaryBackgroundOn') : tt('summaryBackgroundOff')}
+          {tt('policy_short_' + config.attention.sound.replace(/-/g, '_'))}
+          {config.notify.enabled ? ` · ${tt('summaryNotifyOn')}` : ''}
         </span>
       </span>
       <span style={styles.summaryMuted}>{countText}</span>

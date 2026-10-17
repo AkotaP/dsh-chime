@@ -6,6 +6,56 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.5.0] — not released
+
+### Added
+
+- **Attention timing** (`attention.sound` / `attention.notify`, CONTRACT §3.7). Both channels now judge *when* to disturb you along two dimensions at once — which session the event came from, and whether the DSH window currently holds focus. Five policies: `current-only` (the previous behaviour), `away` (the Codex desktop default), `away-or-other` (recommended — quiet only while you are actually looking at that session), `always`, `never`. The two channels pick independently but share a single judgement, so the "notifications off, sound still ringing" mismatch the Codex desktop shipped cannot happen here. The settings form swaps the old checkbox for two dropdowns.
+- `src/client/presence.js` — a tolerant focus/visibility probe. Unreadable focus counts as *present*, so a chime never goes silent merely because the signal was missing.
+- The detector exports a pure `shouldDeliver(policy, isActiveSession, focused)`, covered by a truth-table test over all five policies (detection suite 45 → 48 cases).
+
+### Changed
+
+- **`backgroundSessions` is gone.** It is folded into `attention.sound` on read (`true → always`, `false → current-only`) and never written again; `CONTRACT.md` §3.7 documents the new model, and §4.1 / §4.4 / §4.7 follow. The maximum-session-depth field is untouched.
+- `ChimeEvent` gained `notify: boolean`, mirroring `sound`, so a consumer can tell the two channels' verdicts apart.
+- Config suite 6 → 8 cases (attention round-trip, and the `backgroundSessions` migration).
+- Notification bodies name their source explicitly — `From session — "<title>"` instead of a bare conversation title that read like stray text. A session without a title still falls back to the per-event sentence.
+- The settings form is organised by **priority: channel → general → event**. Each event card now carries its own chime source *and* a "send a notification" tick plus a per-event test button, so everything about one event lives in one place; the four notification ticks that used to sit in the notification card are gone. The two quiet rules (maximum session depth, minimum task duration) moved into a shared **General** card, since both gate both channels.
+
+### Fixed
+
+- **The policy dropdowns were unreadable on a dark theme.** The expanded option list is drawn by the operating system, so the `color: inherit` taken from the `<select>` landed as light-on-light. The options now use the `Canvas` / `CanvasText` system colour keywords, which follow the system theme and stay legible in any combination.
+
+## [0.4.0] — not released
+
+### Added
+
+- **System notifications** — a second, independent reminder channel (`src/client/notify.js`, CONTRACT §4.7). Each event can raise a desktop notification in addition to (or instead of) its chime. The channel reads only `config.notify`, so it still fires with sounds switched off or no audio configured, and it deliberately ignores "also play in background sessions" — a notification matters most exactly when you are looking elsewhere. Notifications are always `silent: true` (the chime channel owns sound; otherwise you would hear two tones), clicking one focuses the window and closes it, and the tag `dsh-chime:<kind>:<sessionId>` replaces a session's previous notification instead of stacking. Permission comes from an "Allow" button in the settings form, because browsers require the prompt to be triggered by a user gesture; unsupported environments and denied permission degrade to silence rather than errors.
+- A **Test notification** button in the settings form, next to the permission state. It calls `explain()` first and prints the verdict — "sent", "the master switch is off", "this event type is not ticked", "permission is denied" — so a notification that fails to appear is never just silence.
+- `test/notify.test.mjs`, 14 cases: the master switch, the per-kind toggles, the permission three-state, unsupported environments, a throwing constructor, a throwing `buildMessage`, a throwing `getConfig`, unknown event kinds, click handling, `dispose()`, identical verdicts from `explain()` and `notify()`, and the tag-length bound.
+- Two detection cases that pin the two channels apart: with notifications off, a background-session event is not emitted at all; with them on it is emitted with `sound: false` (43 → 45 cases).
+
+### Changed
+
+- `ChimeEvent` gained `sound: boolean` — the detector's verdict for the **sound** channel, so a consumer can tell "notify only" from "notify and ring" (CONTRACT §4.4).
+- The path hint in both dictionaries, both READMEs and the settings form now shows a POSIX example next to the Windows one (`/home/you/ding.mp3`), so the plugin reads as cross-platform.
+- `CONTRACT.md` §4.1 now documents `completionMinSeconds` and `maxDepth` (they had drifted out of the contract) plus the new `notify` block; §4.7 documents the notifier.
+
+### Fixed
+
+- **Desktop notifications that silently never appeared on Windows.** The `tag` was built as `dsh-chime:<kind>:<sessionId>`, which for DSH's `session-<uuid>` ids lands on **exactly 64 characters** — the ceiling of the Windows toast `Tag` property. Chromium drops an over-long notification **silently**: no banner, no notification-centre entry, not even an `error` event, while `new Notification()` still returns normally. That is why the settings-page test button (short synthetic id, no tag collision) rang every time while real events never did. The tag now keeps the session id's tail and is capped at 48 characters.
+
+## [0.3.2] — not released
+
+### Added
+
+- **Event-driven detection (`detector.poke()`).** The client half now subscribes to `uiSession.sessionStatus` and `sessions.list` and evaluates the moment either source changes, plus once more when the window returns to the foreground; the 400 ms poll stays as a fallback. A hidden page has its timers throttled — Chromium stretches a background tab's `setTimeout` to a second or more, and Chrome's Memory Saver can freeze such a tab outright — so the poll-only detector could hold a "question" or "approval" chime back until the window came forward again. The new path rides DSH's remote channel and never touches a timer.
+- Two detection cases covering `poke()`: it rings immediately with no timer involved, calls arriving while a tick is in flight collapse into a single follow-up run, and a call after `dispose()` does nothing (41 → 43 cases).
+
+### Changed
+
+- `CONTRACT.md` §4.4 documents `poke()` and the rule that polling must stay a fallback rather than the only evaluation path.
+
 ## [0.3.1] — not released
 
 ### Fixed

@@ -24,14 +24,56 @@ export const CHIME_KINDS = Object.freeze(['approval', 'question', 'interrupted',
 export const DEFAULT_CHIME = Object.freeze({ src: '', volume: 0.8, source: 'url' });
 
 /**
+ * 提醒时机策略。
+ * @typedef {'current-only' | 'away' | 'away-or-other' | 'always' | 'never'} AttentionPolicy
+ */
+
+/**
+ * 提醒时机策略全集（顺序即设置页下拉顺序）。覆盖「会话维度 × 窗口焦点维度」：
+ *
+ * | 策略 | 当前会话·聚焦 | 当前会话·失焦 | 其他会话·聚焦 | 其他会话·失焦 |
+ * |---|---|---|---|---|
+ * | `current-only` | 提醒 | 提醒 | — | — |
+ * | `away` | — | 提醒 | — | 提醒 |
+ * | `away-or-other` | — | 提醒 | 提醒 | 提醒 |
+ * | `always` | 提醒 | 提醒 | 提醒 | 提醒 |
+ * | `never` | — | — | — | — |
+ *
+ * `current-only` 是历史行为（旧的 `backgroundSessions: false`）；
+ * `away` 对齐 Codex 桌面端的默认策略；`away-or-other` 是 Codex 那条
+ * 「chat-scoped notification focus mode」功能请求想要、而我们直接能给的行为。
+ *
+ * @type {ReadonlyArray<AttentionPolicy>}
+ */
+export const ATTENTION_POLICIES = Object.freeze([
+  'current-only',
+  'away',
+  'away-or-other',
+  'always',
+  'never',
+]);
+
+/**
  * 默认整份配置。
- * @type {Readonly<{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, maxDepth: number, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
+ * @type {Readonly<{ attention: Readonly<{ sound: AttentionPolicy, notify: AttentionPolicy }>, completionMinSeconds: number, enabled: boolean, maxDepth: number, notify: Readonly<{ enabled: boolean, kinds: Readonly<Record<ChimeKind, boolean>> }>, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
  */
 export const DEFAULT_CONFIG = deepFreeze({
-  backgroundSessions: false, // 背景会话是否也响
+  // 提醒时机（CONTRACT §3.7）：会话维度 × 窗口焦点维度，音效与通知各选一档。
+  // 音效保持「只看当前会话」的既有听感；通知默认更聪明 —— 你正看着那条会话时不必再弹，
+  // 但只要你不在 DSH、或事件来自别的会话，就一定弹。
+  attention: {
+    sound: 'current-only',
+    notify: 'away-or-other',
+  },
   completionMinSeconds: 10, // 完成音的最短任务时长（秒）；0 = 不设门槛
-  enabled: true, // 总开关
+  enabled: true, // 音效总开关
   maxDepth: 0, // 最深发声的会话层级；0 = 只有主对话
+  // 系统通知是**独立于音效**的一条通道：它有自己的总开关与逐类开关，
+  // 不受音效总开关、音源配置的影响（音效关了、没配音源，通知照样弹）。
+  notify: {
+    enabled: false, // 通知总开关（默认关，与音效的「默认静音」保持一致）
+    kinds: { approval: true, question: true, interrupted: true, completed: true },
+  },
   kinds: {
     approval: { src: '', volume: 0.8, source: 'url' },
     question: { src: '', volume: 0.8, source: 'url' },
@@ -57,7 +99,7 @@ export const DEFAULT_CONFIG = deepFreeze({
 
 /**
  * 整份配置快照（`ObservableSnapshot` 风格）。
- * @typedef {{ backgroundSessions: boolean, completionMinSeconds: number, enabled: boolean, maxDepth: number, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
+ * @typedef {{ attention: { sound: AttentionPolicy, notify: AttentionPolicy }, completionMinSeconds: number, enabled: boolean, maxDepth: number, notify: { enabled: boolean, kinds: Record<ChimeKind, boolean> }, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
  */
 
 /**
@@ -78,12 +120,11 @@ export function normalizeConfig(raw) {
 
   return {
     enabled: typeof source.enabled === 'boolean' ? source.enabled : DEFAULT_CONFIG.enabled,
-    backgroundSessions:
-      typeof source.backgroundSessions === 'boolean'
-        ? source.backgroundSessions
-        : DEFAULT_CONFIG.backgroundSessions,
+    // 老配置的 backgroundSessions 在这里折算进 attention.sound，之后即被丢弃。
+    attention: normalizeAttention(source.attention, source.backgroundSessions),
     completionMinSeconds: normalizeMinSeconds(source.completionMinSeconds),
     maxDepth: normalizeMaxDepth(source.maxDepth),
+    notify: normalizeNotify(source.notify),
     kinds: /** @type {Record<ChimeKind, ChimeConfig>} */ (kinds),
   };
 }
@@ -224,6 +265,64 @@ function normalizeVolume(value) {
   return Math.min(1, Math.max(0, value));
 }
 
+/**
+ * 归一化提醒时机配置（CONTRACT §3.7）。
+ *
+ * `attention` 是本版本新加的字段；老配置里的 `backgroundSessions` 在这里**折算**进来，
+ * 折算后该旧字段就不再写出：`true` → 音效 `always`，`false` → 音效 `current-only`。
+ * 通知是新通道，老配置没配过，一律用它自己的默认值。
+ *
+ * @param {unknown} raw 新的 `attention` 原始值。
+ * @param {unknown} legacyBackgroundSessions 老配置的 `backgroundSessions`。
+ * @returns {{ sound: AttentionPolicy, notify: AttentionPolicy }} 合法的提醒时机配置。
+ */
+function normalizeAttention(raw, legacyBackgroundSessions) {
+  const source = isPlainObject(raw) ? raw : {};
+  const legacySound = legacyBackgroundSessions === true ? 'always' : DEFAULT_CONFIG.attention.sound;
+  return {
+    sound: normalizePolicy(source.sound, legacySound),
+    notify: normalizePolicy(source.notify, DEFAULT_CONFIG.attention.notify),
+  };
+}
+
+/**
+ * 归一化单个策略值；缺失、非字符串或未知取值一律回落默认。
+ *
+ * @param {unknown} value 原始值。
+ * @param {AttentionPolicy} fallback 默认策略。
+ * @returns {AttentionPolicy} 合法策略。
+ */
+function normalizePolicy(value, fallback) {
+  return typeof value === 'string' && ATTENTION_POLICIES.includes(value) ? value : fallback;
+}
+
+/**
+ * 归一化通知配置（CONTRACT §4.1）。
+ *
+ * 通知与音效是两条独立通道：这里的 `enabled` 不受音效总开关影响，
+ * `kinds` 逐类决定哪些事件弹系统通知。任何字段缺失/类型错误都回落默认值，
+ * 未知 kind 直接丢弃 —— 与 `normalizeConfig` 的容错策略一致。
+ *
+ * @param {unknown} raw 任意来源（JSON.parse 结果、旧版本数据、null……）。
+ * @returns {{ enabled: boolean, kinds: Record<ChimeKind, boolean> }} 合法通知配置。
+ */
+function normalizeNotify(raw) {
+  const source = isPlainObject(raw) ? raw : {};
+  const rawKinds = isPlainObject(source.kinds) ? source.kinds : {};
+
+  /** @type {Record<string, boolean>} */
+  const kinds = {};
+  for (const kind of CHIME_KINDS) {
+    const value = rawKinds[kind];
+    kinds[kind] = typeof value === 'boolean' ? value : DEFAULT_CONFIG.notify.kinds[kind];
+  }
+
+  return {
+    enabled: typeof source.enabled === 'boolean' ? source.enabled : DEFAULT_CONFIG.notify.enabled,
+    kinds: /** @type {Record<ChimeKind, boolean>} */ (kinds),
+  };
+}
+
 /** 「最短任务时长」的上限（秒）。 */
 const MIN_SECONDS_MAX = 3600;
 
@@ -274,12 +373,24 @@ function configsEqual(a, b) {
   // list can never be updated at all.
   if (
     a.enabled !== b.enabled ||
-    a.backgroundSessions !== b.backgroundSessions ||
     a.completionMinSeconds !== b.completionMinSeconds ||
     a.maxDepth !== b.maxDepth
   ) {
     return false;
   }
+  // 提醒时机同样是顶层字段：漏比较会让下拉框「选了又弹回默认」。
+  if (!a.attention || !b.attention) return false;
+  if (a.attention.sound !== b.attention.sound || a.attention.notify !== b.attention.notify) {
+    return false;
+  }
+  // The notify channel is a top-level field too: without these comparisons a
+  // toggle would be dropped by `commit` and snap back on the next render.
+  if (!a.notify || !b.notify) return false;
+  if (a.notify.enabled !== b.notify.enabled) return false;
+  for (const kind of CHIME_KINDS) {
+    if (a.notify.kinds?.[kind] !== b.notify.kinds?.[kind]) return false;
+  }
+
   for (const kind of CHIME_KINDS) {
     const left = a.kinds[kind];
     const right = b.kinds[kind];

@@ -11,7 +11,7 @@
  *
  * 同源请求自动携带页面已有的 session cookie，**不需要任何 token**。
  *
- * 历史背景（主人环境实测）：host Remote 通道不可用，`uiWorkspace` 的枚举能力在原生
+ * 历史背景（实测）：host Remote 通道不可用，`uiWorkspace` 的枚举能力在原生
  * picker 后端上也不可用（该后端只支持 `pick`），因此本地音频与目录枚举统一改走上面的
  * 同源 HTTP 路由。`uiWorkspace.pickDirectory()` 仍然可用，原生目录选择器保持不变。
  *
