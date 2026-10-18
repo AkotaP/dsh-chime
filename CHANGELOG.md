@@ -6,6 +6,13 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.6.0] — not released
+
+### Added
+
+- **Experimental: bringing the desktop window to the front on click** (`notify.raiseWindow`, off by default, CONTRACT §4.7 / §4.8). A renderer cannot raise its host window — `window.focus()` only moves page focus — so the host half raises it: on Windows a PowerShell Win32 script finds the DSH window (`Chrome_WidgetWin_1`), restores it with `PostMessage(WM_SYSCOMMAND, SC_RESTORE)` and foregrounds it with `SwitchToThisWindow` + `SetForegroundWindow`; macOS and Linux use DSH's registered `dsh://open` protocol. The `dsh://open` route was measured on Windows to be unreliable (the second instance exits with code 1 and the window never comes back), which is why Windows now uses Win32 messages directly. The helper is run with `execFile` and awaited, because DSH's process sandbox silently reaps detached children (a `spawn` returns a pid that is gone a second later); the route response now carries `exitCode` / `stdout` / `stderr`, and the script appends a timestamp to `%TEMP%\dsh-chime-raise.log` so a click can be traced end to end. **A window closed to the system tray is deliberately skipped**: closing hides the window in Electron (`event.preventDefault()` + `window.hide()`), and restoring that hidden HWND from outside leaves the main process's visibility state out of sync — the window appears but freezes (Chromium keeps treating it as hidden). Minimized and covered windows are restored normally; a tray-hidden window must be reopened from the tray until the shell exposes a raise IPC. The cost is one short-lived helper process per click; only Desktop installs are affected, and a browser page skips it. The new `POST /dsh-chime/raise` route accepts only POST with an `x-dsh-chime: raise` header, so a cross-site request cannot raise the window.
+- **Clicking a notification goes to the conversation.** A click now switches the main area to the Session that raised the event, in addition to focusing the DSH window. It uses the client's documented `ctx.uiWorkspace.openSession(sessionId)`, which returns the main area to Conversation even from the plugin or settings page, so a notification is always one click away from the Session that caused it. Unknown or archived Sessions, a host without the service, and the settings form's synthetic test id degrade to the previous focus-only behaviour, and the callback still never throws.
+
 ## [0.5.0] — not released
 
 ### Added

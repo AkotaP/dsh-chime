@@ -28,8 +28,10 @@ DSH 音效插件。四类事件各一个音效，**默认全部为空 → 不响
 
 ## 1. 形态与构建
 
-**纯 client 插件**：host half 只是 Loader 行占位（`export function apply() {}`），全部功能在 client half。
-原因：所需能力全部有现成 Remote 通道（见 §2.1），自建 `@Remote` 需要 Typert 代码生成（`typert.host.js` / `typert.remote-client.js`），不划算。
+**以 client 为主，host half 只做本地路由**：功能主体在 client half；host half 提供三条 loopback 路由
+（`/dsh-chime/asset`、`/dsh-chime/list`、实验性的 `/dsh-chime/raise`，见 §4.8）。原因：音频字节与窗口唤起
+都需要 Node 侧能力，而所需 Remote 通道并不都存在（`directory-picker/unavailable` 等，见 §2.1），自建
+`@Remote` 需要 Typert 代码生成（`typert.host.js` / `typert.remote-client.js`），不划算。
 
 **client bundle 格式**（DSH 的 `window.__ModuleLoader__.load` 协议，证据 `.probe/ui-session-client.js:1-4`、`.probe/client-modules-README.md:48`）：
 
@@ -271,6 +273,7 @@ export const DEFAULT_CONFIG = {
   notify: {                       // 系统通知：独立于音效的第二条通道（§4.7）
     enabled: false,               // 通知总开关
     kinds: { approval: true, question: true, interrupted: true, completed: true },
+    raiseWindow: false,           // 实验性：点击通知时让 Desktop 外壳把窗口带到前台
   },
   kinds: {
     approval:    { src: '', volume: 0.8, source: 'url' },
@@ -425,7 +428,8 @@ UI 内容。**卡片顺序即优先级：通道 → 通用规则 → 事件**：
  * @param {() => Config} [deps.getConfig]                    读 `notify.enabled` / `notify.kinds`
  * @param {typeof Notification} [deps.NotificationCtor]      可注入（默认全局 `Notification`），便于单测
  * @param {(event) => {title: string, body?: string}} [deps.buildMessage] 本地化文案
- * @param {() => void} [deps.onClick]                         点击通知的回调（把窗口拉到前台）
+ * @param {(event: { kind: string, sessionId?: string }) => void} [deps.onClick]
+ *   点击通知的回调（把窗口拉到前台并打开对应会话）
  */
 export function createNotifier(deps) {
   return {
@@ -451,12 +455,49 @@ export function createNotifier(deps) {
   toast 的 `Tag` 属性封顶 64 字符，超长会被 Chromium 整条静默丢弃**（构造函数照样成功、
   `error` 事件都不发、既不弹横幅也不进通知中心）。DSH 的 `session-<uuid>` 拼上前缀正好 64
   字符，这是实测踩出来的坑，`test/notify.test.mjs` 有回归用例钉住。
-- 点击时关闭自己并回调 `onClick`（`index.js` 用它把窗口拉到前台）。
+- 点击时关闭自己并回调 `onClick(event)`（`index.js` 依次做三件事：`window.focus()` 兜底、
+  `ctx.uiWorkspace.openSession(sessionId)` 把主区域切回该会话、以及按实验性字段
+  `notify.raiseWindow` 发一条 `POST /dsh-chime/raise` 让 Desktop 外壳把窗口带到前台）。
+  跳转只对会话列表里存在的 id 执行；服务缺失或目标已归档时降级为仅聚焦，绝不因跳转失败抛错。
+- `notify.raiseWindow` **默认关闭、标注为实验性**：渲染进程没有激活宿主窗口的能力，开启后由
+  host 半唤起窗口（§4.8）：Windows 直接用 Win32 消息（`PostMessage` SC_RESTORE +
+  `SwitchToThisWindow`），macOS / Linux 走 `dsh://open`。代价是每次点击起一个短命辅助进程；
+  只对 Desktop 安装生效，Web 安装直接跳过。
 - 环境不支持（`Notification` 不存在，例如 Node 侧）时 `supported() === false`、`notify()` 恒 `false`。
 - `explain(event)` 走与 `notify()` **完全相同**的判定链，但**不真的弹**，只返回原因码：
   `ready` / `disabled` / `kind-off` / `unsupported` / `permission-<state>` / `config-error` /
   `unknown-kind` / `disposed`。设置页的「测试通知」按钮用它把「点了没反应」变成一句明确的原因；
   `test/notify.test.mjs` 有一条用例专门钉住「两者结论永远一致」。
+
+---
+
+### 4.8 `host/index.js`（owner: host-and-assets）
+
+三条 loopback 路由（`webServer.register({ kind: 'prefix', ... })`）：
+
+| 路由 | 方法 | 作用 |
+|---|---|---|
+| `/dsh-chime/asset?path=<绝对路径>` | GET / HEAD | 音频字节（Content-Type、`no-store`、单段 Range → 206） |
+| `/dsh-chime/list?path=<绝对目录>` | GET / HEAD | `{ path, entries, truncated }`，只列目录与音频白名单文件 |
+| `/dsh-chime/raise` | POST | 实验性：请求 Desktop 外壳把窗口带到前台 |
+
+`raise` 的两道限制（实现见 `createRaiseHandler`）：
+
+- 只接受 `POST`，且必须带 `x-dsh-chime: raise` 头。跨站请求带自定义头会触发 CORS 预检，
+  预检不通过时浏览器不会真正发出请求 —— 避免任意网页把 DSH 窗口弹到前台。
+- 平台命令：Windows 用 PowerShell 执行一段 Win32 脚本（`-EncodedCommand` 传 UTF-16LE）：
+  枚举 `Chrome_WidgetWin_1` + 标题含 `DeepSeek Harness` 的窗口 → 最小化时
+  `PostMessage(WM_SYSCOMMAND, SC_RESTORE)` → `SwitchToThisWindow` + `SetForegroundWindow`。
+  ⚠️ 必须用 `execFile` **同步等待**：DSH 的进程沙箱会静默清理 detached 子进程（`spawn`
+  返回的 pid 一秒后就不存在），等待式执行才能让子进程跑完并把退出码带回响应；脚本另向
+  `%TEMP%\dsh-chime-raise.log` 追加时间戳，便于端到端追踪一次点击；
+  ⚠️ **关闭到托盘（窗口 hidden）时脚本必须跳过、不做任何 Win32 操作**：Electron 的
+  hidden 状态只在主进程里，外部消息能把 HWND 显示出来，但 Chromium 仍认为窗口不可见，
+  实测会整窗卡死（看得见、点不动）。最小化用 `SC_RESTORE`、遮挡用 `SwitchToThisWindow`
+  都正常；托盘隐藏只能由用户从托盘打开，或等外壳提供 show IPC；
+  macOS `open dsh://open`；Linux `xdg-open dsh://open`。未知平台静默返回
+  `{ requested: false }`。进程启动失败只记录在返回值里，**绝不让宿主路由抛错**
+  （`test/raise.test.mjs` 覆盖）。
 
 ---
 

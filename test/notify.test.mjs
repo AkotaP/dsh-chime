@@ -218,14 +218,15 @@ test('未知 kind 不弹（防止上游新增事件时静默刷屏）', () => {
   assert.equal(instances.length, 0);
 });
 
-test('点击通知触发 onClick 并关闭自己；dispose() 关掉全部并让后续调用失效', () => {
+test('点击通知触发 onClick、回调拿到事件本身，并关闭自己；dispose() 关掉全部并让后续调用失效', () => {
   const { FakeNotification, instances } = createFakeNotification();
-  let clicks = 0;
+  /** @type {Array<{ kind: string, sessionId?: string }>} */
+  const clicks = [];
   const notifier = createNotifier({
     getConfig: configWith(),
     NotificationCtor: FakeNotification,
-    onClick: () => {
-      clicks += 1;
+    onClick: (event) => {
+      clicks.push(event);
     },
     onError: silent,
   });
@@ -235,7 +236,11 @@ test('点击通知触发 onClick 并关闭自己；dispose() 关掉全部并让�
   assert.equal(instances.length, 2);
 
   instances[0].onclick();
-  assert.equal(clicks, 1);
+  assert.deepEqual(
+    clicks,
+    [{ kind: 'approval', sessionId: 'a' }],
+    '点击回调必须收到事件：index.js 靠其中的 sessionId 决定跳到哪条对话',
+  );
   assert.equal(instances[0].closed, true, '点过的通知要关掉，避免留在通知中心');
 
   notifier.dispose();

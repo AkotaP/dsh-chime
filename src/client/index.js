@@ -158,6 +158,88 @@ function sessionTitleOf(ctx, sessionId) {
 }
 
 /**
+ * 把 DSH 主区域切到事件所属会话（CONTRACT §4.7）。
+ *
+ * `ctx.uiWorkspace.openSession(id)` 是 ui-workspace 文档化的客户端 API：它同步替换
+ * mainView 引用，并把主区域收回 Conversation（内部 `layout.selectPanel(null)`），
+ * 所以即使人正停在插件页或设置页，点通知也能直接落到那条对话上。
+ *
+ * 只对**已知会话**执行：设置页的「测试通知」用合成 id（`__dsh-chime-test__`），
+ * 会话列表里查不到，点它不该把界面切到空处。服务缺失、目标已归档/已删除、
+ * 或该 API 在宿主升级后改名，一律静默降级 —— 通知已经弹出来了，跳转失败不能
+ * 反过来报错，更不能影响通知的关闭。
+ *
+ * @param {object} ctx Client 根 Context。
+ * @param {unknown} sessionId 事件所属会话 id。
+ */
+function revealSession(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+  let list;
+  try {
+    list = ctx.get('sessions')?.list?.getSnapshot?.();
+  } catch {
+    list = undefined;
+  }
+  // 列表没就绪（启动初期、断线重连、旧宿主）就不猜：通知可能来自上一个进程，
+  // 目标会话未必还存活，宁可不动界面，也不要把空 id 交给 openSession。
+  if (!list || list.phase !== 'ready') return;
+  if (list.byId?.[sessionId] === undefined) return;
+  // 归档会话不跳：用户已经把它收起来了，点一条旧通知不该把它翻出来。读不到就不拦。
+  try {
+    const archived = ctx.get('workspaces')?.list?.getSnapshot?.()?.archivedSessionIds;
+    if (Array.isArray(archived) && archived.includes(sessionId)) return;
+  } catch {
+    // 归档列表不可读：按未归档处理。
+  }
+  try {
+    const workspace = ctx.get('uiWorkspace');
+    if (typeof workspace?.openSession !== 'function') return;
+    // 已经停在目标会话：只保留上面的聚焦，避免重开一次（会闪一下加载态）。
+    // `mainReference` 是 ui-workspace 的内部字段，读不到就照常走 openSession。
+    if (workspace.mainReference?.sessionId === sessionId) return;
+    workspace.openSession(sessionId);
+  } catch (error) {
+    // 跳转是锦上添花：没有该能力时安静放弃。
+    try {
+      globalThis.console?.warn?.('[dsh-chime] session reveal skipped', error);
+    } catch {
+      // 控制台不可用时忽略。
+    }
+  }
+}
+
+/**
+ * 实验性：让 Desktop 外壳把主窗口带到前台（CONTRACT §4.7）。
+ *
+ * 渲染进程没有激活宿主窗口的能力（`window.focus()` 只影响页面焦点），所以这里
+ * 只发一条同源请求，由 host 半唤起窗口：Windows 用 Win32 消息恢复并前置窗口，
+ * macOS / Linux 走 `dsh://open` 协议。
+ *
+ * 三重护栏：配置开关默认关闭；只在桌面版主页面（`dsh-app://app` 且存在
+ * `dshDesktop` 注入）里尝试；请求是 fire-and-forget，失败绝不影响通知关闭。
+ *
+ * @param {object} config 当前配置快照（读 `notify.raiseWindow`）。
+ */
+function raiseDesktopWindow(config) {
+  if (config?.notify?.raiseWindow !== true) return;
+  const location = globalThis.location;
+  if (location?.protocol !== 'dsh-app:' || location?.hostname !== 'app') return;
+  if (globalThis.dshDesktop === undefined) return;
+  try {
+    // 自定义头同时充当防跨站凭据：跨站请求带它会触发 CORS 预检，预检不通过就不会真正发出。
+    void globalThis
+      .fetch?.('/dsh-chime/raise', {
+        method: 'POST',
+        headers: { 'x-dsh-chime': 'raise' },
+        keepalive: true,
+      })
+      ?.catch?.(() => {});
+  } catch {
+    // 实验性增强：安静失败。
+  }
+}
+
+/**
  * 把 `{name}` 占位替换为参数。
  *
  * 与 `settings.jsx` 的 `format()` 同一策略：`locale` 的 `t` 只按 key 取值、不带参数，
@@ -221,13 +303,16 @@ export function apply(ctx) {
         : text(`notify_kind_${event.kind}_body`);
       return { title, body };
     },
-    onClick: () => {
-      // 点了通知就把 DSH 窗口拉到前台（浏览器可能忽略，静默失败即可）。
+    onClick: (event) => {
+      // 点了通知就把 DSH 窗口拉到前台（浏览器可能忽略，静默失败即可），
+      // 再把主区域切到事件所属的对话（CONTRACT §4.7）。
       try {
         globalThis.focus?.();
       } catch {
         // best effort
       }
+      revealSession(ctx, event?.sessionId);
+      raiseDesktopWindow(configStore.getSnapshot());
     },
   });
 

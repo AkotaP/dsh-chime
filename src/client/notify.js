@@ -39,7 +39,8 @@ function defaultOnError(error, where) {
  * @param {() => any} [deps.getConfig] 取配置快照（读 `notify.enabled` / `notify.kinds`）。
  * @param {typeof Notification} [deps.NotificationCtor] 通知构造器；默认取全局 `Notification`。
  * @param {(event: object) => { title: string, body?: string }} [deps.buildMessage] 生成本地化文案。
- * @param {() => void} [deps.onClick] 点击通知时的回调（`index.js` 用来把窗口拉到前台）。
+ * @param {(event: { kind: string, sessionId?: string }) => void} [deps.onClick] 点击通知时的回调
+ *   （`index.js` 用来把窗口拉到前台并打开对应会话）。
  * @param {(error: unknown, where: string) => void} [deps.onError] 错误上报（默认写控制台）。
  * @returns {{
  *   supported: () => boolean,
@@ -162,8 +163,9 @@ export function createNotifier(deps) {
    * 记住一条已弹出的通知，并在它关闭/点击时清理引用。
    *
    * @param {any} notification 通知实例。
+   * @param {{ kind: string, sessionId?: string }} event 触发它的 ChimeEvent；点击时原样交给 `onClick`。
    */
-  function track(notification) {
+  function track(notification, event) {
     open.add(notification);
     const forget = () => {
       open.delete(notification);
@@ -182,7 +184,7 @@ export function createNotifier(deps) {
         forget();
         if (typeof onClick === 'function') {
           try {
-            onClick();
+            onClick(event);
           } catch (error) {
             report(error, 'onclick');
           }
@@ -272,7 +274,7 @@ export function createNotifier(deps) {
       return false;
     }
 
-    track(notification);
+    track(notification, event);
     return true;
   }
 

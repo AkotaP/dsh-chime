@@ -55,7 +55,7 @@ export const ATTENTION_POLICIES = Object.freeze([
 
 /**
  * 默认整份配置。
- * @type {Readonly<{ attention: Readonly<{ sound: AttentionPolicy, notify: AttentionPolicy }>, completionMinSeconds: number, enabled: boolean, maxDepth: number, notify: Readonly<{ enabled: boolean, kinds: Readonly<Record<ChimeKind, boolean>> }>, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
+ * @type {Readonly<{ attention: Readonly<{ sound: AttentionPolicy, notify: AttentionPolicy }>, completionMinSeconds: number, enabled: boolean, maxDepth: number, notify: Readonly<{ enabled: boolean, kinds: Readonly<Record<ChimeKind, boolean>>, raiseWindow: boolean }>, kinds: Readonly<Record<ChimeKind, ChimeConfig>> }>}
  */
 export const DEFAULT_CONFIG = deepFreeze({
   // 提醒时机（CONTRACT §3.7）：会话维度 × 窗口焦点维度，音效与通知各选一档。
@@ -73,6 +73,9 @@ export const DEFAULT_CONFIG = deepFreeze({
   notify: {
     enabled: false, // 通知总开关（默认关，与音效的「默认静音」保持一致）
     kinds: { approval: true, question: true, interrupted: true, completed: true },
+    // 实验性（CONTRACT §4.8）：点击通知时让桌面版窗口回到前台。默认关闭 ——
+    // 它会在宿主侧起一个短命的辅助进程，只对 Desktop 安装有意义。
+    raiseWindow: false,
   },
   kinds: {
     approval: { src: '', volume: 0.8, source: 'url' },
@@ -99,7 +102,7 @@ export const DEFAULT_CONFIG = deepFreeze({
 
 /**
  * 整份配置快照（`ObservableSnapshot` 风格）。
- * @typedef {{ attention: { sound: AttentionPolicy, notify: AttentionPolicy }, completionMinSeconds: number, enabled: boolean, maxDepth: number, notify: { enabled: boolean, kinds: Record<ChimeKind, boolean> }, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
+ * @typedef {{ attention: { sound: AttentionPolicy, notify: AttentionPolicy }, completionMinSeconds: number, enabled: boolean, maxDepth: number, notify: { enabled: boolean, kinds: Record<ChimeKind, boolean>, raiseWindow: boolean }, kinds: Record<ChimeKind, ChimeConfig> }} ChimeConfigSnapshot
  */
 
 /**
@@ -303,8 +306,11 @@ function normalizePolicy(value, fallback) {
  * `kinds` 逐类决定哪些事件弹系统通知。任何字段缺失/类型错误都回落默认值，
  * 未知 kind 直接丢弃 —— 与 `normalizeConfig` 的容错策略一致。
  *
+ * ⚠️ settings.jsx 里有一份镜像归一化（它不 import 本文件）；新增字段时两处都要改，
+ * 否则界面会出现「写了又被过滤掉 → 开关弹回」的假死。
+ *
  * @param {unknown} raw 任意来源（JSON.parse 结果、旧版本数据、null……）。
- * @returns {{ enabled: boolean, kinds: Record<ChimeKind, boolean> }} 合法通知配置。
+ * @returns {{ enabled: boolean, kinds: Record<ChimeKind, boolean>, raiseWindow: boolean }} 合法通知配置。
  */
 function normalizeNotify(raw) {
   const source = isPlainObject(raw) ? raw : {};
@@ -320,6 +326,10 @@ function normalizeNotify(raw) {
   return {
     enabled: typeof source.enabled === 'boolean' ? source.enabled : DEFAULT_CONFIG.notify.enabled,
     kinds: /** @type {Record<ChimeKind, boolean>} */ (kinds),
+    raiseWindow:
+      typeof source.raiseWindow === 'boolean'
+        ? source.raiseWindow
+        : DEFAULT_CONFIG.notify.raiseWindow,
   };
 }
 
@@ -387,6 +397,7 @@ function configsEqual(a, b) {
   // toggle would be dropped by `commit` and snap back on the next render.
   if (!a.notify || !b.notify) return false;
   if (a.notify.enabled !== b.notify.enabled) return false;
+  if (a.notify.raiseWindow !== b.notify.raiseWindow) return false;
   for (const kind of CHIME_KINDS) {
     if (a.notify.kinds?.[kind] !== b.notify.kinds?.[kind]) return false;
   }

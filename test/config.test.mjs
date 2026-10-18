@@ -129,6 +129,24 @@ test('notify 的总开关与逐类开关都真的能写进去（configsEqual 覆
   });
 });
 
+test('notify.raiseWindow 默认关闭、能写进去，且非法值回落默认（configsEqual 覆盖了它）', () => {
+  withStorage(() => {
+    const store = createConfigStore();
+    assert.equal(store.getSnapshot().notify.raiseWindow, false, '实验性开关必须默认关闭');
+
+    store.update({ notify: { ...store.getSnapshot().notify, raiseWindow: true } });
+    assert.equal(
+      store.getSnapshot().notify.raiseWindow,
+      true,
+      'update({ notify.raiseWindow }) 被 commit 丢掉了——configsEqual 没比较 notify.raiseWindow',
+    );
+
+    // 归一化容错：非布尔值回落默认，而不是把整份配置写坏。
+    store.update({ notify: { ...store.getSnapshot().notify, raiseWindow: 'yes' } });
+    assert.equal(store.getSnapshot().notify.raiseWindow, DEFAULT_CONFIG.notify.raiseWindow);
+  });
+});
+
 test('setKind still updates one per-kind field', () => {
   withStorage(() => {
     const store = createConfigStore();
@@ -158,6 +176,17 @@ test('an unchanged write is still a no-op', () => {
     store.update({ maxDepth: before.maxDepth });
     assert.equal(store.getSnapshot(), before, 'writing the same value should keep the same snapshot');
   });
+});
+
+test('settings.jsx 的镜像归一化与 DEFAULT_CONFIG.notify 保持同字段（漏同步会让开关弹回）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('../src/client/settings.jsx', import.meta.url), 'utf8');
+  for (const key of Object.keys(DEFAULT_CONFIG.notify)) {
+    assert.ok(
+      source.includes(key),
+      `settings.jsx 里没有 ${key}：它的镜像归一化会把该字段过滤掉，界面开关会「点了马上弹回」`,
+    );
+  }
 });
 
 test('normalization clamps bounds and falls back on junk', () => {

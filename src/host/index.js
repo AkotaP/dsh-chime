@@ -8,10 +8,11 @@
  * （证据 `.probe/host-webserver.js:229-236`），页面又已持有 session cookie，
  * 于是浏览器可以像普通 `<audio src>` 一样直接拉取本地音频。
  *
- * 两条路由：
+ * 三条路由：
  * - `GET /dsh-chime/asset?path=<绝对路径>&v=<版本>` → 音频字节
  *   （正确 Content-Type、`Cache-Control: no-store`、支持单段 Range → 206）
  * - `GET /dsh-chime/list?path=<绝对目录>` → `{ path, entries, truncated }`
+ * - `POST /dsh-chime/raise` → 实验性：让 Desktop 外壳把窗口带到前台（CONTRACT §4.8）
  *
  * 安全边界（刻意为之，与本任务契约一致）：**不做 workspace/根目录约束**，
  * 只要求绝对路径；asset 额外要求扩展名在音频白名单内。理由是这个服务只监听
@@ -23,6 +24,8 @@
  * @module dsh-chime/host
  */
 
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, resolve } from 'node:path';
 
@@ -46,6 +49,12 @@ const ASSET_ROUTE_PATH = '/dsh-chime/asset';
 /** 目录列表路由（prefix）。 */
 const LIST_ROUTE_PATH = '/dsh-chime/list';
 
+/** 实验性「把桌面窗口带到前台」路由（prefix，CONTRACT §4.7）。 */
+const RAISE_ROUTE_PATH = '/dsh-chime/raise';
+
+/** 防跨站凭据头：跨站请求带自定义头会触发预检，预检不通过时浏览器不会真正发出请求。 */
+const RAISE_HEADER = 'x-dsh-chime';
+
 /** `parseRangeHeader` 的三态返回值之一：语法合法但不可满足（→ 416）。 */
 const INVALID_RANGE = Symbol('dsh-chime.invalid-range');
 
@@ -53,7 +62,7 @@ const INVALID_RANGE = Symbol('dsh-chime.invalid-range');
 export const inject = ['webServer'];
 
 /**
- * 插件入口：注册两条本地音频路由。
+ * 插件入口：注册本地音频路由与一条实验性窗口唤起路由。
  *
  * @param {object} ctx Host 根 Context（含 `webServer` 服务）。
  * @returns {(() => void)|undefined} 没有 `ctx.effect` 时直接返回 disposer。
@@ -68,7 +77,8 @@ export function apply(ctx) {
 }
 
 /**
- * 注册两条路由；服务缺失或注册失败时降级为「不注册」，绝不让插件激活失败。
+ * 注册三条路由（音频字节、目录列表、实验性窗口唤起）；服务缺失或注册失败时
+ * 降级为「不注册」，绝不让插件激活失败。
  *
  * @param {object} ctx Host 根 Context。
  * @returns {() => void} 释放已注册路由的 disposer。
@@ -84,6 +94,7 @@ function registerLocalAudioRoutes(ctx) {
   const routes = [
     { kind: 'prefix', path: ASSET_ROUTE_PATH, handler: handleAssetRequest },
     { kind: 'prefix', path: LIST_ROUTE_PATH, handler: handleListRequest },
+    { kind: 'prefix', path: RAISE_ROUTE_PATH, handler: createRaiseHandler() },
   ];
   for (const route of routes) {
     try {
@@ -153,6 +164,152 @@ async function handleListRequest(req, res) {
   } catch (error) {
     sendJson(res, 500, { error: `dsh-chime list route failed: ${messageOf(error)}` });
   }
+}
+
+/**
+ * 建 `/dsh-chime/raise` 的请求处理器（实验性，CONTRACT §4.8）。
+ *
+ * 渲染进程没有激活宿主窗口的能力（`window.focus()` 只影响页面焦点），所以由这里
+ * 唤起外壳：Windows 用 Win32（`PostMessage` SC_RESTORE + `SwitchToThisWindow`，
+ * 见 `WINDOWS_RAISE_SCRIPT`），macOS / Linux 用 DSH 已注册的 `dsh://open`。
+ * 每次点击起一个短命的辅助进程，不阻塞通知关闭。
+ *
+ * 两道限制：只接受 `POST`；必须带 `x-dsh-chime: raise` 头。跨站请求带自定义头会
+ * 触发 CORS 预检，预检不通过时浏览器不会把真正的请求发出来 —— 避免任意网页把
+ * DSH 窗口弹到前台。路由本身也只在 loopback 上监听。
+ *
+ * @param {{ spawn?: Function, platform?: string }} [deps] 依赖（测试注入；默认用真实进程与平台）。
+ * @returns {(req: object, res: object) => void} 路由处理器。
+ */
+export function createRaiseHandler(deps = {}) {
+  const execImpl = typeof deps?.execFile === 'function' ? deps.execFile : execFile;
+  const platform = typeof deps?.platform === 'string' ? deps.platform : process.platform;
+
+  return async function handleRaiseRequest(req, res) {
+    try {
+      if (methodOf(req) !== 'POST') {
+        sendJson(res, 405, { requested: false, error: 'method not allowed; use POST' });
+        return;
+      }
+      if (headerOf(req, RAISE_HEADER) !== 'raise') {
+        sendJson(res, 403, { requested: false, error: 'missing raise credential' });
+        return;
+      }
+      const spec = raiseCommandFor(platform);
+      if (spec === null) {
+        sendJson(res, 202, { requested: false });
+        return;
+      }
+      const outcome = await runRaise(execImpl, spec);
+      sendJson(res, 202, { ...outcome, command: spec.command });
+    } catch (error) {
+      sendJson(res, 500, { requested: false, error: messageOf(error) });
+    }
+  };
+}
+
+/**
+ * Windows 上激活 DSH 主窗口的 PowerShell 脚本（实验性，CONTRACT §4.8）。
+ *
+ * 为什么不用 dsh://open：第二实例启动慢，实测以退出码 1 结束，主实例的
+ * second-instance → focusPrimaryWindow() 并没有把最小化的窗口恢复；Windows 的
+ * 前台锁还会拒绝裸 SetForegroundWindow。这里直接走 Win32：
+ * - IsIconic 判断最小化，PostMessage(WM_SYSCOMMAND, SC_RESTORE) 恢复（实测有效）；
+ * - SwitchToThisWindow + SetForegroundWindow 把窗口带到前台。
+ *
+ * ⚠️ **隐藏（关闭到托盘）的窗口一律跳过**：Electron 的 hidden 状态只在主进程里，
+ * 外部 Win32 消息能把 HWND 显示出来，但 Chromium 仍认为窗口不可见，结果是
+ * 「窗口看得见却点不动」——实测会整窗卡死。这一档只能等上游提供 show IPC。
+ *
+ * 脚本是固定字符串、不含外部输入；用 -EncodedCommand（UTF-16LE）传入，
+ * 避免引号与转义在 cmd/PowerShell 层被二次解释。
+ */
+const WINDOWS_RAISE_SCRIPT = "$log = Join-Path $env:TEMP 'dsh-chime-raise.log'\ntry { Add-Content -Path $log -Value ((Get-Date -Format o) + ' raise') } catch {}\nAdd-Type -TypeDefinition @'\nusing System;\nusing System.Text;\nusing System.Runtime.InteropServices;\npublic class DshChimeRaise {\n  public delegate bool EnumProc(IntPtr h, IntPtr p);\n  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);\n  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr h);\n  [DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr h);\n  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int cmd);\n  [DllImport(\"user32.dll\")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);\n  [DllImport(\"user32.dll\")] public static extern void SwitchToThisWindow(IntPtr h, bool alt);\n  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n  [DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);\n  [DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);\n}\n'@\n$script:target = [IntPtr]::Zero\n$cb = [DshChimeRaise+EnumProc]{\n  param($h, $p)\n  $cn = New-Object System.Text.StringBuilder 256\n  [void][DshChimeRaise]::GetClassNameW($h, $cn, 256)\n  $sb = New-Object System.Text.StringBuilder 512\n  [void][DshChimeRaise]::GetWindowTextW($h, $sb, 512)\n  if ($cn.ToString() -eq 'Chrome_WidgetWin_1' -and $sb.ToString() -like '*DeepSeek Harness*') {\n    $script:target = $h\n    return $false\n  }\n  return $true\n}\n[void][DshChimeRaise]::EnumWindows($cb, [IntPtr]::Zero)\nif ($script:target -ne [IntPtr]::Zero) {\n  if (-not [DshChimeRaise]::IsWindowVisible($script:target)) {\n    try { Add-Content -Path $log -Value 'skipped-hidden' } catch {}\n  } else {\n    if ([DshChimeRaise]::IsIconic($script:target)) {\n      [void][DshChimeRaise]::PostMessage($script:target, 0x0112, [IntPtr]0xF120, [IntPtr]::Zero)\n      Start-Sleep -Milliseconds 300\n    }\n    [DshChimeRaise]::SwitchToThisWindow($script:target, $true)\n    [void][DshChimeRaise]::SetForegroundWindow($script:target)\n  }\n}";
+
+/**
+ * 取某平台的「唤起窗口」命令；未知平台返回 null（静默降级）。
+ *
+ * @param {string} platform 平台名。
+ * @returns {{ command: string, args: string[] }|null} 启动命令。
+ */
+function raiseCommandFor(platform) {
+  if (platform === 'win32') {
+    return {
+      command: resolvePowerShellPath(),
+      args: [
+        '-NoProfile',
+        '-NonInteractive',
+        '-WindowStyle',
+        'Hidden',
+        '-EncodedCommand',
+        Buffer.from(WINDOWS_RAISE_SCRIPT, 'utf16le').toString('base64'),
+      ],
+    };
+  }
+  // macOS：open 会触发 app 的 open-url，DSH 主进程里已接到 focusPrimaryWindow；
+  // Linux：xdg-open 交给桌面环境，通常没有 Windows 那种前台锁。
+  if (platform === 'darwin') return { command: 'open', args: ['dsh://open'] };
+  if (platform === 'linux') return { command: 'xdg-open', args: ['dsh://open'] };
+  return null;
+}
+
+/**
+ * 解析 PowerShell 的绝对路径。
+ *
+ * 宿主进程的 PATH 未必包含 System32（实测 spawn('powershell.exe') 静默失败、
+ * 子进程根本没出现），所以优先用绝对路径，最后才回落到裸名字。
+ *
+ * @returns {string} 可执行文件路径。
+ */
+function resolvePowerShellPath() {
+  const roots = [process.env.SystemRoot, process.env.windir, 'C:\\Windows'].filter(
+    (root) => typeof root === 'string' && root.length > 0,
+  );
+  for (const root of roots) {
+    const candidate = join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      // 读不到就试下一个候选。
+    }
+  }
+  return 'powershell.exe';
+}
+
+/**
+ * 执行唤起命令并等待它结束（`execFile`，不经 shell、参数不拼字符串）。
+ *
+ * 用等待而不是 detached spawn：DSH 的进程沙箱会静默清理 detached 子进程，
+ * 之前「请求 202、窗口不动、连进程都看不到」就是这么来的。等到进程真正结束，
+ * 响应才能带上退出码与 stderr —— 失败可诊断，成功也说明脚本确实跑完了。
+ *
+ * @param {Function} execImpl `execFile`（测试注入）。
+ * @param {{ command: string, args: string[] }} spec 启动命令。
+ * @returns {Promise<{ requested: boolean, exitCode: number|null, error?: string, stdout?: string, stderr?: string }>} 执行结果。
+ */
+function runRaise(execImpl, spec) {
+  return new Promise((resolve) => {
+    try {
+      execImpl(
+        spec.command,
+        spec.args,
+        { windowsHide: true, timeout: 8000 },
+        (error, stdout, stderr) => {
+          const output = String(stdout ?? '').trim();
+          const diagnostics = String(stderr ?? '').trim();
+          resolve({
+            requested: error === null,
+            exitCode: error === null ? 0 : typeof error.code === 'number' ? error.code : null,
+            ...(error === null ? {} : { error: messageOf(error) }),
+            ...(output === '' ? {} : { stdout: output.slice(0, 400) }),
+            ...(diagnostics === '' ? {} : { stderr: diagnostics.slice(0, 400) }),
+          });
+        },
+      );
+    } catch (error) {
+      resolve({ requested: false, exitCode: null, error: messageOf(error) });
+    }
+  });
 }
 
 /**

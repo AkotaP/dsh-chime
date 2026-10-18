@@ -30,7 +30,7 @@
 | **会话级焦点**（事件来自非当前对话也通知） | ❌ 仍是一条功能请求 | ✅ **已有**：`sessions.list.byId[id].retainedBy.mainView > 0` 就是"当前正在看的会话" |
 | 声音与通知解耦 | ⚠️ 出过"关了通知声仍响"的 bug | ✅ 两条独立通道，配置互不引用 |
 | 通知去重 | conversationId + turnId + eventType | ✅ `tag = dsh-chime:<kind>:<会话id>` + 上升沿判定 |
-| 通知点击定位到会话 | ✅ | ⚠️ 只做了 `window.focus()`，没跳会话 |
+| 通知点击定位到会话 | ✅ | ✅ 已落地（0.6.0）：`uiWorkspace.openSession(sessionId)`，拿不到就退回只 `focus()` |
 | 完成判定粒度 | turn 级 | ✅ 比 turn 更严：`running === false` **且**无在跑子代理 **且**无后台 job，外加 1200ms 防抖 |
 | 通知动作按钮 | ⚠️ 有，但有"点了没真批准"的问题 | ➖ 建议**不做** |
 | 应用内 Activity 视图 | ✅ | ➖ 不建议做，DSH 侧边栏已覆盖 |
@@ -128,7 +128,7 @@ notify: {
 | 增强 | 做法 | 为什么值得 |
 |---|---|---|
 | **撤回过期通知** | `presence.subscribe` + `pendingInteraction` 消失时，`close()` 掉对应 tag 的通知（`notify.js` 已有 `open` 集合，加一个 `revoke(kind, sessionId)` 即可） | 审批处理完了，那条"等待授权"还挂在通知中心，纯噪音 |
-| **点击定位到会话** | `onClick` 里带上 `sessionId`，尝试把 DSH 切到该会话（优先用 DSH 的会话切换能力，拿不到就退回 `window.focus()`） | 多项目并行时，通知的价值一半在于"点进去就是那条对话" |
+| **点击定位到会话** ✅ | 已落地（0.6.0）：`notify.js` 把事件交给 `onClick(event)`，`index.js` 调 `ctx.uiWorkspace.openSession(sessionId)`；只对已知会话执行，服务缺失时退回 `window.focus()` | 多项目并行时，通知的价值一半在于"点进去就是那条对话" |
 | **去重** | 已有：`tag` 按会话 + 上升沿判定；⚠️ tag 长度受 Windows 的 64 字符上限约束，已在 `tagFor()` 里截尾封顶 48 | 已解决，写进来是防止回归 |
 
 ---
@@ -149,7 +149,7 @@ notify: {
 | 阶段 | 内容 | 规模 |
 |---|---|---|
 | **P0** | `presence.js` + `attention` 五档策略（替换 `backgroundSessions`）+ 设置页两个下拉 + 迁移 + 测试 | 一轮，改动集中在 `config.js` / `detect.js` / `index.js` / `settings.jsx` |
-| **P1** | 通知撤回 + 点击跳转会话 | 一轮，集中在 `notify.js` / `index.js` |
+| **P1** | 点击跳转会话 ✅（0.6.0）；通知撤回待做 | 一轮，集中在 `notify.js` / `index.js` |
 | **P2**（可选） | 通知音与音效通道的联动开关、按事件类型分别设置策略 | 按需 |
 
 P0 之后，chime 在通知策略上就同时具备 Codex 的焦点感知**和** Codex 还没有的会话感知。
@@ -163,6 +163,7 @@ P0 之后，chime 在通知策略上就同时具备 Codex 的焦点感知**和**
 3. ⚠️ **通知权限**：Electron 里 `Notification.permission` 是 `granted`；DSH 主进程对某些 session 设了"一律拒绝"的权限处理器，但不拦这条路径（2026-10-17 实测：手动 `new Notification` 与插件调用都能弹）。
 4. ⚠️ **`document.hasFocus()` 在 DevTools 打开时为 false** —— 测策略时记得先关掉或心里有数。
 5. ⚠️ **通知必须 `silent: true`**：声音归音效通道，否则同一事件会"双响"。
+6. ⚠️ **渲染进程的通知点击不会激活宿主窗口**：Electron 里 `onclick` 能跑，但 `window.focus()` 只改页面焦点；最小化或被遮挡时窗口不会回到前台。DSH 桌面壳的 `focusPrimaryWindow()` 只挂在托盘、`dsh://open`、`second-instance`、`activate` 上，preload 也没暴露窗口控制 IPC。**`dsh://open` 也不行**：Windows 实测第二实例退出码 1、窗口不恢复，且裸 `SetForegroundWindow` 被前台锁拒绝。实验性缓解（0.6.0，`notify.raiseWindow`，默认关）：host 半在 Windows 上用 Win32 脚本操作窗口（`PostMessage` SC_RESTORE 恢复最小化、`SwitchToThisWindow` 前置；macOS / Linux 走 `dsh://open`）。⚠️ **隐藏（关闭到托盘）的窗口必须跳过**——Electron 的 hidden 状态只在主进程，外部 Win32 硬拉会让窗口「看得见但点不动」（实测整窗卡死）；这一档只能从托盘打开，或等外壳 IPC。代价是每次点击起一个短命 PowerShell；**正路仍是给外壳加一条 raise IPC**。
 
 ---
 

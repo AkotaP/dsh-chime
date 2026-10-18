@@ -180,11 +180,13 @@ try {
   apply(ctx);
   const asset = routes.get('/dsh-chime/asset');
   const list = routes.get('/dsh-chime/list');
+  const raise = routes.get('/dsh-chime/raise');
   ok('inject 声明 webServer', Array.isArray(inject) && inject.join() === 'webServer', JSON.stringify(inject));
-  ok('注册了两条路由', routes.size === 2, String(routes.size));
+  ok('注册了三条路由', routes.size === 3, String(routes.size));
   ok('asset 是 prefix 路由', asset && asset.kind === 'prefix', JSON.stringify(asset && asset.kind));
   ok('list 是 prefix 路由', list && list.kind === 'prefix', JSON.stringify(list && list.kind));
-  ok('handler 是函数', typeof asset?.handler === 'function' && typeof list?.handler === 'function');
+  ok('raise 是 prefix 路由', raise && raise.kind === 'prefix', JSON.stringify(raise && raise.kind));
+  ok('handler 是函数', typeof asset?.handler === 'function' && typeof list?.handler === 'function' && typeof raise?.handler === 'function');
 
   // ---------- asset ----------
   const a1 = await call(asset, { url: routeUrl('/dsh-chime/asset', join(media, 'alpha.wav')) });
@@ -291,6 +293,14 @@ try {
   const l7 = await call(list, { raw: true });
   ok('list 畸形 req -> 400', l7.status === 400, String(l7.status));
 
+  // ---------- raise（实验性；只测拒绝分支，避免真的拉起实例） ----------
+  const ra1 = await call(raise, { method: 'POST' });
+  ok('raise 缺凭据头 -> 403', ra1.status === 403, String(ra1.status));
+  const ra2 = await call(raise, { method: 'GET', headers: { 'x-dsh-chime': 'raise' } });
+  ok('raise 非 POST -> 405', ra2.status === 405, String(ra2.status));
+  const ra3 = await call(raise, { raw: true });
+  ok('raise 畸形 req -> 405 且不抛异常', ra3.status === 405 && ra3.ended === true, String(ra3.status));
+
   // 截断
   const big = join(root, 'big');
   await mkdir(big, { recursive: true });
@@ -319,7 +329,7 @@ try {
   // ---------- 生命周期 / 降级 ----------
   ok('ctx.effect 捕获到 cleanup', cleanups.length === 1 && typeof cleanups[0] === 'function');
   cleanups[0]();
-  ok('disposer 释放了两条路由', disposed.length === 2 && routes.size === 0, JSON.stringify(disposed));
+  ok('disposer 释放了三条路由', disposed.length === 3 && routes.size === 0, JSON.stringify(disposed));
 
   const missingWarnings = [];
   let missingCleanup;
@@ -350,7 +360,7 @@ try {
 
   const noEffectCtx = makeCtx({ effect: false });
   const disposer = apply(noEffectCtx);
-  ok('无 ctx.effect 时直接返回 disposer', typeof disposer === 'function' && routes.size === 2, String(routes.size));
+  ok('无 ctx.effect 时直接返回 disposer', typeof disposer === 'function' && routes.size === 3, String(routes.size));
   disposer();
   ok('直接返回的 disposer 可用', routes.size === 0);
 } finally {

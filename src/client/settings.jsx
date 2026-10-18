@@ -58,10 +58,17 @@ const MAX_DEPTH_MAX = 16;
  */
 const ATTENTION_POLICY_ORDER = ['current-only', 'away', 'away-or-other', 'always', 'never'];
 
-/** 通知配置的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG.notify`。 */
+/**
+ * 通知配置的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG.notify`。
+ *
+ * ⚠️ 本文件有一份与 config.js **镜像**的归一化（刻意不 import，只依赖契约签名），
+ * 所以 `notify` 新增字段时必须同时改这里与 `config.js` 的 `normalizeNotify` ——
+ * 漏一处的表现是「开关点了马上弹回」：store 写进去了，但 `readSnapshot` 又把它过滤掉。
+ */
 const FALLBACK_NOTIFY = {
   enabled: false,
   kinds: { approval: true, question: true, interrupted: true, completed: true },
+  raiseWindow: false,
 };
 
 /** 提醒时机的兜底形状，来自 CONTRACT §4.1 的 `DEFAULT_CONFIG.attention`。 */
@@ -115,6 +122,16 @@ const styles = {
   },
   kindLabel: {
     fontWeight: 600,
+  },
+  /** 「实验性」小标签：让未成熟的功能在视觉上与正式项区分开。 */
+  experimental: {
+    padding: '0 6px',
+    borderRadius: '999px',
+    border: '1px solid rgba(127, 127, 127, 0.45)',
+    fontSize: '11px',
+    lineHeight: '18px',
+    opacity: 0.7,
+    whiteSpace: 'nowrap',
   },
   hint: {
     opacity: 0.62,
@@ -371,7 +388,7 @@ function normalizePolicy(value, fallback) {
  * （`true → always`、`false → current-only`），折算后不再写出。
  *
  * @param {unknown} raw 来自 configStore 的快照
- * @returns {{ enabled: boolean, attention: { sound: string, notify: string }, completionMinSeconds: number, maxDepth: number, notify: { enabled: boolean, kinds: Record<string, boolean> }, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
+ * @returns {{ enabled: boolean, attention: { sound: string, notify: string }, completionMinSeconds: number, maxDepth: number, notify: { enabled: boolean, kinds: Record<string, boolean>, raiseWindow: boolean }, kinds: Record<string, {src:string,volume:number,source:'url'|'file'|'local'}> }}
  */
 function normalizeConfig(raw) {
   const value = raw && typeof raw === 'object' ? raw : {};
@@ -398,6 +415,10 @@ function normalizeConfig(raw) {
     notify: {
       enabled: typeof rawNotify.enabled === 'boolean' ? rawNotify.enabled : FALLBACK_NOTIFY.enabled,
       kinds: notifyKinds,
+      raiseWindow:
+        typeof rawNotify.raiseWindow === 'boolean'
+          ? rawNotify.raiseWindow
+          : FALLBACK_NOTIFY.raiseWindow,
     },
     kinds,
   };
@@ -1018,6 +1039,22 @@ export function ChimeSettings(props) {
             </button>
           ) : null}
         </div>
+
+        {/*
+          实验性（CONTRACT §4.7）：默认关闭。开启后点通知会让 host 半去唤起桌面窗口
+          —— 渲染进程自己做不到，只能由宿主半走 Win32（Windows）或 dsh://open（其他平台）。
+        */}
+        <label style={styles.toggleRow}>
+          <input
+            type="checkbox"
+            style={styles.checkbox}
+            checked={config.notify.raiseWindow === true}
+            onChange={(event) => updateNotify({ raiseWindow: event.target.checked })}
+          />
+          <span>{tt('notifyRaiseWindow')}</span>
+          <span style={styles.experimental}>{tt('experimentalTag')}</span>
+        </label>
+        <p style={styles.hint}>{tt('notifyRaiseWindowHint')}</p>
 
       </section>
 
