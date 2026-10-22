@@ -72,7 +72,7 @@ dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime
 - **播放走 Web Audio**（`AudioContext` + `decodeAudioData` + `BufferSource` + `GainNode`）。
   插件会在首次 `pointerdown`/`keydown` 解锁 `AudioContext`，之后自动播放才被允许。
 - **事件驱动为主、轮询兜底**：订阅 DSH 的 `uiSession.sessionStatus` 与 `sessions.list`，状态一变立即判定，窗口回到前台时再补一次；400ms 轮询只当保险丝。后台页面会被节流 —— 隐藏标签页的 `setTimeout` 被拉长到秒级甚至更粗（浏览器里开着「内存节省」还可能直接冻结标签页），纯轮询会让「提问 / 审批」音效压到你切回 DSH 才响。订阅走 DSH 的 remote 推送，不经过定时器，所以窗口藏在后台照样即时。
-- **通知是第二条独立通道**：只认 `config.notify`（总开关 + 逐类开关），走浏览器的 `Notification`，每条固定 `silent: true`（声音归音效管，否则会「双响」）。首次要在设置页点一次「授权」—— 浏览器要求权限请求落在用户手势里；环境不支持或权限被拒时静默降级，不报错。点击通知会走 ui-workspace 的 `openSession` 切回该事件所属的对话，并在会话已不存在或宿主没有该能力时退回只聚焦窗口，绝不报错。桌面版还有实验性的「把窗口带到前台」开关（`notify.raiseWindow`，默认关闭）：由宿主半唤起窗口 —— Windows 用 Win32 消息恢复最小化并前置窗口，macOS / Linux 走 `dsh://open`，代价是每次点击起一个短命辅助进程。关闭到系统托盘的窗口不会自动恢复（隐藏窗口从外部硬拉会卡死，请从托盘打开）。网页里没有窗口控制权限，所以 Web 安装直接跳过。
+- **通知是第二条独立通道**：只认 `config.notify`（总开关 + 逐类开关），走浏览器的 `Notification`，每条固定 `silent: true`（声音归音效管，否则会「双响」）。首次要在设置页点一次「授权」—— 浏览器要求权限请求落在用户手势里；环境不支持或权限被拒时静默降级，不报错。点击通知会走 ui-workspace 的 `openSession` 切回该事件所属的对话，并在会话已不存在或宿主没有该能力时退回只聚焦窗口，绝不报错。桌面版还有实验性的「把窗口带到前台」开关（`notify.raiseWindow`，默认关闭）：Windows 按 Desktop 进程定位窗口，恢复最小化，关闭到托盘时通过桌面外壳显示，再核对实际前台状态；普通后台仍无法激活时，只做一次短暂最小化/恢复，可能出现闪动。macOS / Linux 走 `dsh://open`。并发点击共享一个短命辅助进程；系统仍可能拒绝激活，失败会保留诊断，不保证每次成功。网页里没有窗口控制权限，所以 Web 安装直接跳过。
 - **事件判定**参考 DSH 自身的侧边栏状态机：`running` 只表示 agent loop 在跑，**不等于**任务结束，所以「完成」用复合判定（见 [`CONTRACT.md`](./CONTRACT.md) §3）。
 
 ## 开发

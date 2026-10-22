@@ -25,6 +25,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { buildWindowsRaiseScript } from './windows-raise.js';
 import { existsSync } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, resolve } from 'node:path';
@@ -169,21 +170,22 @@ export async function handleListRequest(req, res) {
 /**
  * 建 `/dsh-chime/raise` 的请求处理器（实验性，CONTRACT §4.8）。
  *
- * 渲染进程没有激活宿主窗口的能力（`window.focus()` 只影响页面焦点），所以由这里
- * 唤起外壳：Windows 用 Win32（`PostMessage` SC_RESTORE + `SwitchToThisWindow`，
- * 见 `WINDOWS_RAISE_SCRIPT`），macOS / Linux 用 DSH 已注册的 `dsh://open`。
- * 每次点击起一个短命的辅助进程，不阻塞通知关闭。
+ * 页面 focus 不能保证原生窗口激活，因此由宿主请求 Desktop 恢复/显示/聚焦，
+ * Windows 额外核对前台 HWND；macOS / Linux 使用 dsh://open。
+ * 并发点击共享一个短命辅助进程，不阻塞通知关闭。
  *
  * 两道限制：只接受 `POST`；必须带 `x-dsh-chime: raise` 头。跨站请求带自定义头会
  * 触发 CORS 预检，预检不通过时浏览器不会把真正的请求发出来 —— 避免任意网页把
  * DSH 窗口弹到前台。路由本身也只在 loopback 上监听。
  *
- * @param {{ spawn?: Function, platform?: string }} [deps] 依赖（测试注入；默认用真实进程与平台）。
+ * @param {{ execFile?: Function, platform?: string, desktopPid?: number }} [deps] 依赖（测试注入；默认用真实进程与平台）。
  * @returns {(req: object, res: object) => void} 路由处理器。
  */
 export function createRaiseHandler(deps = {}) {
   const execImpl = typeof deps?.execFile === 'function' ? deps.execFile : execFile;
   const platform = typeof deps?.platform === 'string' ? deps.platform : process.platform;
+  const desktopPid = deps.desktopPid === undefined ? process.ppid : deps.desktopPid;
+  let inFlight = null;
 
   return async function handleRaiseRequest(req, res) {
     try {
@@ -195,36 +197,26 @@ export function createRaiseHandler(deps = {}) {
         sendJson(res, 403, { requested: false, error: 'missing raise credential' });
         return;
       }
-      const spec = raiseCommandFor(platform);
+      const spec = raiseCommandFor(platform, desktopPid);
       if (spec === null) {
         sendJson(res, 202, { requested: false });
         return;
       }
-      const outcome = await runRaise(execImpl, spec);
-      sendJson(res, 202, { ...outcome, command: spec.command });
+      // Coalesce simultaneous notification clicks; never interleave foreground helpers.
+      const pending = inFlight ??= runRaise(execImpl, spec);
+      try {
+        const outcome = await pending;
+        sendJson(res, 202, { ...outcome, command: spec.command });
+      } finally {
+        if (inFlight === pending) inFlight = null;
+      }
     } catch (error) {
       sendJson(res, 500, { requested: false, error: messageOf(error) });
     }
   };
 }
 
-/**
- * Windows 上激活 DSH 主窗口的 PowerShell 脚本（实验性，CONTRACT §4.8）。
- *
- * 为什么不用 dsh://open：第二实例启动慢，实测以退出码 1 结束，主实例的
- * second-instance → focusPrimaryWindow() 并没有把最小化的窗口恢复；Windows 的
- * 前台锁还会拒绝裸 SetForegroundWindow。这里直接走 Win32：
- * - IsIconic 判断最小化，PostMessage(WM_SYSCOMMAND, SC_RESTORE) 恢复（实测有效）；
- * - SwitchToThisWindow + SetForegroundWindow 把窗口带到前台。
- *
- * ⚠️ **隐藏（关闭到托盘）的窗口一律跳过**：Electron 的 hidden 状态只在主进程里，
- * 外部 Win32 消息能把 HWND 显示出来，但 Chromium 仍认为窗口不可见，结果是
- * 「窗口看得见却点不动」——实测会整窗卡死。这一档只能等上游提供 show IPC。
- *
- * 脚本是固定字符串、不含外部输入；用 -EncodedCommand（UTF-16LE）传入，
- * 避免引号与转义在 cmd/PowerShell 层被二次解释。
- */
-const WINDOWS_RAISE_SCRIPT = "$log = Join-Path $env:TEMP 'dsh-chime-raise.log'\ntry { Add-Content -Path $log -Value ((Get-Date -Format o) + ' raise') } catch {}\nAdd-Type -TypeDefinition @'\nusing System;\nusing System.Text;\nusing System.Runtime.InteropServices;\npublic class DshChimeRaise {\n  public delegate bool EnumProc(IntPtr h, IntPtr p);\n  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);\n  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr h);\n  [DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr h);\n  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int cmd);\n  [DllImport(\"user32.dll\")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);\n  [DllImport(\"user32.dll\")] public static extern void SwitchToThisWindow(IntPtr h, bool alt);\n  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n  [DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);\n  [DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);\n}\n'@\n$script:target = [IntPtr]::Zero\n$cb = [DshChimeRaise+EnumProc]{\n  param($h, $p)\n  $cn = New-Object System.Text.StringBuilder 256\n  [void][DshChimeRaise]::GetClassNameW($h, $cn, 256)\n  $sb = New-Object System.Text.StringBuilder 512\n  [void][DshChimeRaise]::GetWindowTextW($h, $sb, 512)\n  if ($cn.ToString() -eq 'Chrome_WidgetWin_1' -and $sb.ToString() -like '*DeepSeek Harness*') {\n    $script:target = $h\n    return $false\n  }\n  return $true\n}\n[void][DshChimeRaise]::EnumWindows($cb, [IntPtr]::Zero)\nif ($script:target -ne [IntPtr]::Zero) {\n  if (-not [DshChimeRaise]::IsWindowVisible($script:target)) {\n    try { Add-Content -Path $log -Value 'skipped-hidden' } catch {}\n  } else {\n    if ([DshChimeRaise]::IsIconic($script:target)) {\n      [void][DshChimeRaise]::PostMessage($script:target, 0x0112, [IntPtr]0xF120, [IntPtr]::Zero)\n      Start-Sleep -Milliseconds 300\n    }\n    [DshChimeRaise]::SwitchToThisWindow($script:target, $true)\n    [void][DshChimeRaise]::SetForegroundWindow($script:target)\n  }\n}";
+/** Windows restores hidden windows through Desktop, then verifies the actual foreground HWND. */
 
 /**
  * 取某平台的「唤起窗口」命令；未知平台返回 null（静默降级）。
@@ -232,17 +224,18 @@ const WINDOWS_RAISE_SCRIPT = "$log = Join-Path $env:TEMP 'dsh-chime-raise.log'\n
  * @param {string} platform 平台名。
  * @returns {{ command: string, args: string[] }|null} 启动命令。
  */
-function raiseCommandFor(platform) {
+function raiseCommandFor(platform, desktopPid) {
   if (platform === 'win32') {
     return {
       command: resolvePowerShellPath(),
+      verifyActivation: true,
       args: [
         '-NoProfile',
         '-NonInteractive',
         '-WindowStyle',
         'Hidden',
         '-EncodedCommand',
-        Buffer.from(WINDOWS_RAISE_SCRIPT, 'utf16le').toString('base64'),
+        Buffer.from(buildWindowsRaiseScript(desktopPid), 'utf16le').toString('base64'),
       ],
     };
   }
@@ -299,6 +292,9 @@ function runRaise(execImpl, spec) {
           const diagnostics = String(stderr ?? '').trim();
           resolve({
             requested: error === null,
+            ...(spec.verifyActivation ? error === null
+              ? parseActivationResult(output)
+              : { activated: false, reason: 'helper-failed' } : {}),
             exitCode: error === null ? 0 : typeof error.code === 'number' ? error.code : null,
             ...(error === null ? {} : { error: messageOf(error) }),
             ...(output === '' ? {} : { stdout: output.slice(0, 400) }),
@@ -307,9 +303,36 @@ function runRaise(execImpl, spec) {
         },
       );
     } catch (error) {
-      resolve({ requested: false, exitCode: null, error: messageOf(error) });
+      resolve({ requested: false, exitCode: null, error: messageOf(error),
+        ...(spec.verifyActivation ? { activated: false, reason: 'helper-failed' } : {}),
+      });
     }
   });
+}
+
+/** A successful helper exit is not proof of foreground activation. */
+function parseActivationResult(output) {
+  try {
+    const result = JSON.parse(output);
+    const reasons = ['activated', 'already-foreground', 'foreground-denied', 'hidden',
+      'not-found', 'restore-pending', 'interrupted', 'ambiguous', 'protocol-error', 'helper-error'];
+    if (!result || typeof result.activated !== 'boolean' || !reasons.includes(result.reason)
+      || !Number.isInteger(result.attempts) || result.attempts < 0 || result.attempts > 4
+      || !['normal', 'minimized', 'hidden', 'unknown'].includes(result.initialState)
+      || typeof result.protocolRequested !== 'boolean'
+      || (result.restoreCycle !== undefined && typeof result.restoreCycle !== 'boolean')
+      || (result.activated && result.initialState === 'unknown')
+      || result.activated !== ['activated', 'already-foreground'].includes(result.reason)) {
+      throw new Error('invalid activation result');
+    }
+    return { activated: result.activated, reason: result.reason, attempts: result.attempts,
+      initialState: result.initialState, protocolRequested: result.protocolRequested,
+      ...(typeof result.restoreCycle === 'boolean' ? { restoreCycle: result.restoreCycle } : {}),
+      ...(Number.isFinite(result.elapsedMs) && result.elapsedMs >= 0 ? { elapsedMs: result.elapsedMs } : {}),
+    };
+  } catch {
+    return { activated: false, reason: 'invalid-result' };
+  }
 }
 
 /**

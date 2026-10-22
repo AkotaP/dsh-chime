@@ -459,10 +459,9 @@ export function createNotifier(deps) {
   `ctx.uiWorkspace.openSession(sessionId)` 把主区域切回该会话、以及按实验性字段
   `notify.raiseWindow` 发一条 `POST /dsh-chime/raise` 让 Desktop 外壳把窗口带到前台）。
   跳转只对会话列表里存在的 id 执行；服务缺失或目标已归档时降级为仅聚焦，绝不因跳转失败抛错。
-- `notify.raiseWindow` **默认关闭、标注为实验性**：渲染进程没有激活宿主窗口的能力，开启后由
-  host 半唤起窗口（§4.8）：Windows 直接用 Win32 消息（`PostMessage` SC_RESTORE +
-  `SwitchToThisWindow`），macOS / Linux 走 `dsh://open`。代价是每次点击起一个短命辅助进程；
-  只对 Desktop 安装生效，Web 安装直接跳过。
+- `notify.raiseWindow` **默认关闭、标注为实验性**：页面聚焦不能保证原生窗口激活，开启后由
+  host 半请求 Desktop 恢复并聚焦（§4.8）。Windows 校验实际前台窗口；macOS / Linux 走
+  `dsh://open`。并发点击共享一次辅助进程执行，只对 Desktop 安装生效，Web 安装直接跳过。
 - 环境不支持（`Notification` 不存在，例如 Node 侧）时 `supported() === false`、`notify()` 恒 `false`。
 - `explain(event)` 走与 `notify()` **完全相同**的判定链，但**不真的弹**，只返回原因码：
   `ready` / `disabled` / `kind-off` / `unsupported` / `permission-<state>` / `config-error` /
@@ -485,19 +484,20 @@ export function createNotifier(deps) {
 
 - 只接受 `POST`，且必须带 `x-dsh-chime: raise` 头。跨站请求带自定义头会触发 CORS 预检，
   预检不通过时浏览器不会真正发出请求 —— 避免任意网页把 DSH 窗口弹到前台。
-- 平台命令：Windows 用 PowerShell 执行一段 Win32 脚本（`-EncodedCommand` 传 UTF-16LE）：
-  枚举 `Chrome_WidgetWin_1` + 标题含 `DeepSeek Harness` 的窗口 → 最小化时
-  `PostMessage(WM_SYSCOMMAND, SC_RESTORE)` → `SwitchToThisWindow` + `SetForegroundWindow`。
-  ⚠️ 必须用 `execFile` **同步等待**：DSH 的进程沙箱会静默清理 detached 子进程（`spawn`
-  返回的 pid 一秒后就不存在），等待式执行才能让子进程跑完并把退出码带回响应；脚本另向
-  `%TEMP%\dsh-chime-raise.log` 追加时间戳，便于端到端追踪一次点击；
-  ⚠️ **关闭到托盘（窗口 hidden）时脚本必须跳过、不做任何 Win32 操作**：Electron 的
-  hidden 状态只在主进程里，外部消息能把 HWND 显示出来，但 Chromium 仍认为窗口不可见，
-  实测会整窗卡死（看得见、点不动）。最小化用 `SC_RESTORE`、遮挡用 `SwitchToThisWindow`
-  都正常；托盘隐藏只能由用户从托盘打开，或等外壳提供 show IPC；
-  macOS `open dsh://open`；Linux `xdg-open dsh://open`。未知平台静默返回
-  `{ requested: false }`。进程启动失败只记录在返回值里，**绝不让宿主路由抛错**
-  （`test/raise.test.mjs` 覆盖）。
+- Windows 使用 PowerShell（`-EncodedCommand`，UTF-16LE），按宿主父进程 PID 精确选择 Desktop
+  主窗口；无目标或存在多个候选时不猜测。最小化窗口通过 `SC_RESTORE` 恢复；隐藏窗口只由
+  Desktop 的单实例 `dsh://open` 路径显示，不直接调用 Win32 `ShowWindow`。启动副实例前清除
+  子进程环境中的 `ELECTRON_RUN_AS_NODE` 等 Node 模式变量，不停止或重启现有实例。
+- Windows 激活先调用普通前台 API，再通过 Desktop 请求恢复并做有限重试；不注入 Alt，
+  不附加输入线程，不修改系统前台锁。正常可见窗口仍无法激活时，最后只做一次短暂最小化/
+  恢复，可能出现闪动；诊断字段 `restoreCycle` 标明是否走过此路径。隐藏窗口不走此降级。
+  新输入切换到其他前台窗口后取消重试；单纯鼠标移动不会取消。系统仍可能拒绝激活。
+- `execFile` 等待辅助进程结束，超时为 8 秒；并发请求合并，完成或失败后均允许下一次执行。
+  `requested` 仅表示命令执行成功，Windows 的 `activated` 才表示已核对前台 HWND；`reason`
+  区分未找到、候选歧义、隐藏、还原未完成、前台拒绝、输入打断及辅助进程错误。脚本将
+  结构化结果追加到临时目录的诊断日志，客户端保留失败诊断但不阻塞通知关闭。
+- macOS 使用 `open dsh://open`，Linux 使用 `xdg-open dsh://open`，不据退出码宣称真实聚焦；
+  未知平台返回 `{ requested: false }`。命令失败转为响应结果，不向宿主路由外抛异常。
 
 ---
 
