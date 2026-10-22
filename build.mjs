@@ -59,6 +59,8 @@ function findEsbuild() {
 
 const esbuild = findEsbuild();
 fs.mkdirSync(path.join(root, 'lib'), { recursive: true });
+// Keep the PowerShell source beside the bundled host; package.json already includes lib/.
+fs.copyFileSync(path.join(root, 'src/host/windows-raise.ps1'), path.join(root, 'lib/windows-raise.ps1'));
 
 /**
  * Run one esbuild CLI invocation.

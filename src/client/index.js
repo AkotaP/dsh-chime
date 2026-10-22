@@ -211,9 +211,8 @@ function revealSession(ctx, sessionId) {
 /**
  * 实验性：让 Desktop 外壳把主窗口带到前台（CONTRACT §4.7）。
  *
- * 渲染进程没有激活宿主窗口的能力（`window.focus()` 只影响页面焦点），所以这里
- * 只发一条同源请求，由 host 半唤起窗口：Windows 用 Win32 消息恢复并前置窗口，
- * macOS / Linux 走 `dsh://open` 协议。
+ * 页面 focus 不能保证原生窗口激活，所以额外请求 host 半恢复并验证前台窗口；
+ * 隐藏窗口交给 Desktop 外壳显示，避免 Win32 与 Electron 的可见状态不一致。
  *
  * 三重护栏：配置开关默认关闭；只在桌面版主页面（`dsh-app://app` 且存在
  * `dshDesktop` 注入）里尝试；请求是 fire-and-forget，失败绝不影响通知关闭。
@@ -233,7 +232,15 @@ function raiseDesktopWindow(config) {
         headers: { 'x-dsh-chime': 'raise' },
         keepalive: true,
       })
-      ?.catch?.(() => {});
+      ?.then?.(async (response) => {
+        const result = await response.json();
+        if (!response.ok || result.requested === false || result.activated === false) {
+          globalThis.console?.warn?.('[dsh-chime] window activation was not confirmed', result);
+        }
+      })
+      ?.catch?.((error) => {
+        globalThis.console?.warn?.('[dsh-chime] window activation request failed', error);
+      });
   } catch {
     // 实验性增强：安静失败。
   }
