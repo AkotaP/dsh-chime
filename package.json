@@ -1,6 +1,6 @@
 {
   "name": "dsh-chime",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "DSH web plugin: per-event notification chimes for approval, question, interruption and completion — each with its own source and volume, configured on the plugin's own page",
   "type": "module",
   "main": "lib/index.js",

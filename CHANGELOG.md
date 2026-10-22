@@ -6,6 +6,18 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.6.1] — not released
+
+### Fixed
+
+- Windows notification activation now identifies the Desktop window by process, verifies actual foreground activation, and restores tray-hidden windows through the desktop shell.
+- Concurrent clicks share one helper. Foreground retries are bounded; a visible background window can use one minimize/restore fallback without simulated Alt or input-thread attachment.
+- Activation failures retain structured diagnostics, and Chinese/English settings hints describe the supported recovery behavior.
+
+### Changed
+
+- The PowerShell helper is a separate source and distribution asset, with build, standalone-loading and package-content checks.
+
 ## [0.6.0] — not released
 
 ### Added
