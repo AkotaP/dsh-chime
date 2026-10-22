@@ -77,7 +77,7 @@ export const zh = {
   // —— 实验性：点击通知把桌面窗口带到前台（CONTRACT §4.7）——
   notifyRaiseWindow: '点击通知时把窗口带到前台',
   notifyRaiseWindowHint:
-    '实验性功能，默认关闭。开启后点通知会让宿主半唤起桌面窗口：最小化或被遮挡时恢复并前置（Windows 用 Win32，macOS / Linux 走 dsh://open）。关闭到系统托盘时不会自动恢复——隐藏的 Electron 窗口无法从外部安全唤起，硬拉会卡死，请从托盘图标打开。代价是短暂启动一个辅助进程。仅 Desktop 安装有效，Web 版会忽略。',
+    '实验性功能，默认关闭。Windows 会恢复最小化窗口，并通过桌面外壳显示关闭到托盘的窗口，再校验实际前台状态。普通后台仍无法激活时，会短暂最小化后恢复一次，可能闪动；系统仍可能拒绝激活。macOS / Linux 走 dsh://open。并发点击共享一个短命辅助进程。仅 Desktop 安装有效，Web 版会忽略。',
   experimentalTag: '实验性',
   notify_kind_approval_title: 'DSH · 等待授权',
   notify_kind_approval_body: '有工具调用在等你的批准。',
@@ -186,7 +186,7 @@ export const en = {
   notifyTestDisposed: 'Not sent: the plugin has been disposed.',
   notifyRaiseWindow: 'Bring the window to the front on click',
   notifyRaiseWindowHint:
-    'Experimental, off by default. A click asks the host half to raise the desktop window: Windows restores and foregrounds a minimized or covered window with Win32 messages (a window closed to the tray is skipped — a hidden Electron window cannot be restored from outside without freezing), while macOS and Linux use the dsh://open protocol. The cost is one short-lived helper process. Desktop installs only — the browser ignores it.',
+    'Experimental, off by default. Windows restores minimized windows and asks the desktop shell to show tray-hidden windows, then verifies foreground activation. If a visible background window still cannot be activated, one brief minimize/restore cycle may cause flicker; the OS can still deny activation. macOS and Linux use dsh://open. Concurrent clicks share a short-lived helper process. Desktop installs only — the browser ignores it.',
   experimentalTag: 'Experimental',
   notify_kind_approval_title: 'DSH · Approval needed',
   notify_kind_approval_body: 'A tool call is waiting for your approval.',
