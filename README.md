@@ -95,6 +95,11 @@ node tools/link-install.mjs web
 
 架构、用到的 DSH API 面、事件规则见 [`CONTRACT.md`](./CONTRACT.md)；版本历史见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
+## 分支版本
+
+- `main` 使用 `M.m.p`；`playground` 使用 `M.(m+1).p-playground.n`。第一段相同，第二段比主线大 1，第三段与主线同步；`n` 单独记录 playground 自身更新。
+- 例如主线为 `0.6.1` 时，对应 `0.7.1-playground.1`；playground 再次独立更新后为 `0.7.1-playground.2`。主包与 XP 子包版本一致，预发布使用独立 `playground` 渠道。
+
 ## 兼容性
 
 - Node.js `>=20`

@@ -96,6 +96,11 @@ node tools/link-install.mjs web
 Architecture, the DSH API surface used, and the event rules are in [`CONTRACT.md`](./CONTRACT.md).
 Release history is in [`CHANGELOG.md`](./CHANGELOG.md).
 
+## Branch versions
+
+- Main uses `M.m.p`; playground uses `M.(m+1).p-playground.n`. The major matches main, the minor is always one higher, and the patch follows main. The independent `n` counter records playground-only iterations.
+- For main `0.6.1`, an example is `0.7.1-playground.1`; the next playground-only update is `0.7.1-playground.2`. The main package and XP subpackage share an identical version, and prereleases use the separate `playground` channel.
+
 ## Compatibility
 
 - Node.js `>=20`

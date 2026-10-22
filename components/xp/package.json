@@ -1,6 +1,6 @@
 {
   "name": "dsh-chime-xp",
-  "version": "0.7.0-playground",
+  "version": "0.7.1-playground.1",
   "description": "Optional MC-style experience orb chimes after tool calls; independent of notification chimes",
   "type": "module",
   "main": "lib/index.js",

@@ -16,7 +16,8 @@ test('XP is a real named dependency bundled with the main package, not a path-on
   assert.deepEqual(readJson(manifestPath), readJson(new URL('../components/xp/package.json', import.meta.url)));
   assert.equal(readJson(manifestPath).name, 'dsh-chime-xp');
   assert.equal(readJson(manifestPath).version, root.version);
-  assert.match(root.version, /-playground$/);
+  assert.match(root.version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-playground\.(0|[1-9]\d*)$/,
+    'playground versions must include their own numeric prerelease iteration');
   const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
   assert.ok(patch.includes("name: 'dsh-chime-xp'"));
   assert.ok(!patch.includes('components/xp/lib/index.js'));
