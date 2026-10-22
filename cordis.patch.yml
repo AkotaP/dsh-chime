@@ -1,3 +1,6 @@
 - insert:
     - id: chime
       name: 'dsh-chime'
+    - id: chime-xp
+      name: 'dsh-chime-xp'
+      disabled: true

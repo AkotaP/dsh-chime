@@ -551,3 +551,25 @@ dsh-chime/
 
 构建命令：`node build.mjs`（需先 `pnpm add -D esbuild`）。
 
+## 7. 可选经验球组件
+
+本节覆盖 §6 原先的单组件打包说明；原通知行为不变。
+
+- Loader 行：`chime-xp`，具名入口 `dsh-chime-xp`，默认 disabled。子包通过主包的工作区依赖及 `bundledDependencies` 分发；不需要单独发布，不引入第三方运行时依赖。开发环境须建立该工作区依赖链接，打包须实际携带其 `node_modules` 内容。
+- 展示元信息：子包导出 `./locale/*.json`，中英 `meta.title` 分别为“经验球音效”和“Experience orb chimes”。行 ID、客户端模块 ID、配置槽位和 localStorage 键与旧路径入口保持一致。
+- 宿主仅注册自身的 `/dsh-chime-xp/asset` 与 `/dsh-chime-xp/list`，复用原请求处理器。不依赖通知 fiber，也不注册窗口唤起路由。
+- 浏览器使用 `src/xp/index.js` 组装，仅在 `plugins.row.config` 的 `dsh-chime#chime-xp` 注册配置 UI。原 bundle 配置 UI 不添加经验球控件。
+- 配置键为 `dsh.chime.xp.config.v1`，独立 store；字段与范围见 `docs/xp-orbs.md`。自动播放默认关闭，音源默认空，音量默认 0.1，时长默认 1–3 秒，频率默认 6 个/秒。
+- 从当前会话借用 binding.eventSource，仅读取新增 append 中的 `tool/result`，不按工具名称筛选；初始历史、replace、prepend、已处理 seq 不触发。会话切换释放旧订阅，不额外 retain。
+- 同时仅一个连响计时器，重入取 max(end, now + sampleDuration)，不按次数累加；每秒最多 10 声，不补播定时器错过的机会。
+- 每声 pitch = 0.9 + (r1-r2)*0.35，通过 playbackRate 同步变速变调。允许自然尾音重叠，全引擎最多 32 个声部；原引擎默认 allowOverlap=false，原通知同类打断行为不变。
+- 配置关闭/音源改变、失焦或隐藏（除非允许后台）、等待交互、Agent 空闲、会话切换与组件卸载均取消调度和在途播放，不影响其他组件。
+- 所有监听、计时器、音频节点和订阅随组件释放。单声试听和节奏试听仍使用自选音源，不内置或下载 MC 文件。
+- 构建生成 `lib/{index,client}.js` 和 `components/xp/lib/{index,client}.js`。最低宿主版本为 0.2.1-rc.2。
+
+## 8. 分支与版本
+
+- `main` 维护正式通知功能；`playground` 长期维护可选整活功能，不默认向 `main` 合并。
+- `playground` 与当前 `main` 基线保持相同主版本号，次版本号比该基线大 1，并保留 `-playground` 后缀。例如 `main` 为 `0.6.0` 时，本分支从 `0.7.0-playground` 开始。
+- 第三段记录本分支所有需要发布的迭代，包括新功能、修复和吸收主线更新。吸收新的主/次版本基线时重新按该基线计算版本，并将第三段归零。
+- 主包与经验球子包同步版本；仅采用 SemVer 的版本格式，第三段的迭代用途是本分支的项目约定。对外发布使用独立 `playground` 渠道，不覆盖正式渠道 `latest`。

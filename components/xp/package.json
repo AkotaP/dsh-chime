@@ -1,0 +1,33 @@
+{
+  "name": "dsh-chime-xp",
+  "version": "0.7.0-playground",
+  "description": "Optional MC-style experience orb chimes after tool calls; independent of notification chimes",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "package.json"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "license": "MIT",
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "external": []
+    }
+  }
+}

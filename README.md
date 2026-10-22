@@ -33,9 +33,15 @@ DSH（DeepSeek Harness）Web 通知音效插件。
 
 ![配置界面](docs/img/ui.png)
 
+## 可选经验球组件
+
+组件列表新增默认关闭的 **经验球**（`chime-xp`）。开启组件后，进入该行的配置页，设置自备音源并启用自动经验音。任意工具调用完成后，按可配置的随机时长和频率连续播放 MC 风格变调音。原通知组件可独立开关，设置互不影响。
+
+默认 1–3 秒、每秒 6 声、10% 音量，失焦暂停。支持单声与 10 秒节奏试听；不附带或下载 MC 音效。详见[经验球规则与设置](docs/xp-orbs.md)。
+
 ## 安装
 
-> 安装会改动 `%USERPROFILE%\.dsh` 下的 profile 配置，并且需要重启 DSH（重启会打断正在跑的会话）。请确认后执行。
+> 安装会改动 `%USERPROFILE%\.dsh` 下的 profile 配置，请确认后执行。支持 HMR 的 profile 通常会热重组；不要自动重启 DSH 或打断正在运行的会话。
 
 仓库：<https://github.com/AkotaP/dsh-chime>
 
@@ -50,11 +56,11 @@ dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime
 
 **让 agent 装**（把下面这段发给 DSH 里的 agent）：
 
-> 把这个仓库装进当前 DSH 的 desktop profile：`https://github.com/AkotaP/dsh-chime`。用侧边栏「插件」页的「添加插件」，或 `dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime`。装完确认 profile 的 `dsh.profile.bundles` 里已经有 `dsh-chime`，然后**先问我**再重启 DSH，重启后确认插件页的**提示音**卡片能打开配置表单。
+> 把这个仓库装进当前 DSH 的 desktop profile：`https://github.com/AkotaP/dsh-chime`。用侧边栏「插件」页的「添加插件」，或 `dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime`。装完确认 profile 的 `dsh.profile.bundles` 里已经有 `dsh-chime`，然后确认插件页的**提示音**卡片能打开配置表单；仅在宿主明确报告需要重启时另行询问，不自动重启。
 
 **本地开发**（以 link 方式装进某个 profile，源码改动实时生效）：见下面的[开发](#开发)一节。
 
-装好后**重启 DSH**，插件页的**提示音**卡片里出现配置表单。卸载：侧边栏「插件」页里卸载，或 `dsh plugin --profile desktop remove dsh-chime`（并确认 `dsh.profile.bundles` 里已移除该项）。
+装好后在插件页确认应用状态及配置表单；仅在宿主明确报告需要重启时另行确认。卸载：侧边栏「插件」页里卸载，或 `dsh plugin --profile desktop remove dsh-chime`（并确认 `dsh.profile.bundles` 里已移除该项）。
 
 ## 实现要点
 
@@ -73,7 +79,7 @@ dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime
 
 ```bash
 pnpm install
-node build.mjs                 # 产出 lib/index.js 与 lib/client.js
+node build.mjs                 # 产出通知与经验球两组 host/client bundle
 node test/detect.test.mjs      # 43 个事件判定用例
 node tools/verify-apply.mjs    # 用 stub context 真正执行一次 apply()
 node tools/verify-host-routes.mjs
@@ -92,7 +98,7 @@ node tools/link-install.mjs web
 ## 兼容性
 
 - Node.js `>=20`
-- DSH `>=0.2.0-rc.2`
+- DSH `>=0.2.1-rc.2`
 
 ## 许可
 

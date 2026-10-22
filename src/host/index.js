@@ -143,7 +143,7 @@ function resolveWebServer(ctx) {
  * @param {import('node:http').ServerResponse} res 响应。
  * @returns {Promise<void>} 永远 resolve。
  */
-async function handleAssetRequest(req, res) {
+export async function handleAssetRequest(req, res) {
   try {
     await serveAsset(req, res);
   } catch (error) {
@@ -158,7 +158,7 @@ async function handleAssetRequest(req, res) {
  * @param {import('node:http').ServerResponse} res 响应。
  * @returns {Promise<void>} 永远 resolve。
  */
-async function handleListRequest(req, res) {
+export async function handleListRequest(req, res) {
   try {
     await serveList(req, res);
   } catch (error) {

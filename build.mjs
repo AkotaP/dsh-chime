@@ -81,37 +81,30 @@ run([
   '--log-level=warning',
 ]);
 
-// --- client half: CJS in a temp file, then wrapped in the loader protocol --
-const rawPath = path.join(root, 'lib', '.client.raw.cjs');
+// --- client halves: independently owned factories, sharing bundled source code ---
+function buildClient(entry, directory, moduleId) {
+  fs.mkdirSync(path.join(root, directory), { recursive: true });
+  const rawPath = path.join(root, directory, '.client.raw.cjs');
+  run([
+    entry, '--bundle', '--format=cjs', '--platform=browser', '--target=es2022',
+    '--jsx=automatic', ...CLIENT_EXTERNALS.map((name) => '--external:' + name),
+    '--outfile=' + path.relative(root, rawPath), '--log-level=warning',
+  ]);
+  const body = fs.readFileSync(rawPath, 'utf8').split('\n')
+    .map((line) => line.length > 0 ? '    ' + line : line).join('\n');
+  const wrapped = 'window.__ModuleLoader__.load({\n  id: ' + JSON.stringify(moduleId) +
+    ',\n  factory: (require) => {\n    var module = { exports: {} };\n    var exports = module.exports;\n' +
+    body + '\n    return module.exports;\n  }\n});\n';
+  fs.writeFileSync(path.join(root, directory, 'client.js'), wrapped);
+  fs.rmSync(rawPath, { force: true });
+}
+
+buildClient('src/client/index.js', 'lib', pkg.name);
+const xp = JSON.parse(fs.readFileSync(path.join(root, 'components/xp/package.json'), 'utf8'));
+fs.mkdirSync(path.join(root, 'components/xp/lib'), { recursive: true });
 run([
-  'src/client/index.js',
-  '--bundle',
-  '--format=cjs',
-  '--platform=browser',
-  '--target=es2022',
-  '--jsx=automatic',
-  ...CLIENT_EXTERNALS.map((name) => `--external:${name}`),
-  `--outfile=${path.relative(root, rawPath)}`,
-  '--log-level=warning',
+  'src/xp/host.js', '--bundle', '--format=esm', '--platform=node', '--target=node20',
+  '--packages=external', '--outfile=components/xp/lib/index.js', '--log-level=warning',
 ]);
-
-const body = fs
-  .readFileSync(rawPath, 'utf8')
-  .split('\n')
-  .map((line) => (line.length > 0 ? '    ' + line : line))
-  .join('\n');
-
-const wrapped = `window.__ModuleLoader__.load({
-  id: ${JSON.stringify(pkg.name)},
-  factory: (require) => {
-    var module = { exports: {} };
-    var exports = module.exports;
-${body}
-    return module.exports;
-  }
-});
-`;
-
-fs.writeFileSync(path.join(root, 'lib/client.js'), wrapped);
-fs.rmSync(rawPath, { force: true });
-console.log(`built lib/index.js and lib/client.js with ${path.basename(esbuild)}`);
+buildClient('src/xp/index.js', 'components/xp/lib', xp.name);
+console.log('built notification and XP host/client bundles with ' + path.basename(esbuild));

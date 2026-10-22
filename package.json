@@ -1,6 +1,6 @@
 {
   "name": "dsh-chime",
-  "version": "0.6.0",
+  "version": "0.7.0-playground",
   "description": "DSH web plugin: per-event notification chimes for approval, question, interruption and completion — each with its own source and volume, configured on the plugin's own page",
   "type": "module",
   "main": "lib/index.js",
@@ -16,6 +16,7 @@
   },
   "files": [
     "lib",
+    "components/xp",
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
@@ -44,21 +45,27 @@
   ],
   "engines": {
     "node": ">=20",
-    "dsh": ">=0.2.0-rc.2"
+    "dsh": ">=0.2.1-rc.2"
   },
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test test/"
+    "test": "node --test --test-isolation=none test/*.test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh": ">=0.2.0-rc.2"
+    "@deepseek-ai/dsh": ">=0.2.1-rc.2"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh": {
       "optional": true
     }
   },
+  "dependencies": {
+    "dsh-chime-xp": "workspace:*"
+  },
+  "bundledDependencies": [
+    "dsh-chime-xp"
+  ],
   "devDependencies": {
     "esbuild": "^0.25.0"
   },

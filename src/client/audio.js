@@ -14,7 +14,7 @@
  * （`fetch` → `decodeAudioData` → `BufferSource`；失败回退 `HTMLAudioElement`）。
  *
  * 对外契约（`CONTRACT.md` §4.2）保持兼容：`prepare / play / setVolume / preview / dispose`，
- * 另外新增 `unlock()` 与 `lastFailure(kind)`。
+ * 另外提供 `unlock()`、`lastFailure(kind)` 与 `stop(kind?)`。
  *
  * 行为约定：
  * - `src` 为空（含纯空白 / 非字符串）→ 不发声、不构造任何音频对象、**不创建 AudioContext**。
@@ -32,6 +32,9 @@ const DEFAULT_VOLUME = 0.8;
 
 /** `resume()` 的最长等待预算（毫秒）：避免无手势时 `play()` 永久挂起。 */
 const RESUME_BUDGET_MS = 200;
+
+/** 重叠模式的全引擎声部上限；超过时释放最旧声部。 */
+const MAX_VOICES = 32;
 
 /**
  * `local` 源在 IndexedDB 里没有对应文件时的可读原因。
@@ -78,8 +81,8 @@ const FAILURE_MESSAGES = {
 };
 
 /**
- * 音效种类（与 config.js 的 `CHIME_KINDS` 一致）。
- * @typedef {'approval' | 'question' | 'interrupted' | 'completed'} ChimeKind
+ * 音效种类；通知使用 config.js 的四类，也接受独立功能的命名种类（例如 xp）。
+ * @typedef {string} ChimeKind
  */
 
 /**
@@ -95,6 +98,9 @@ const FAILURE_MESSAGES = {
  *   `/dsh-chime/asset?path=...&v=...`；`url` → 原样；`local` → 按 `kind` 从
  *   IndexedDB 取 objectURL，取不到时返回空串）。由 `assets.js` 的
  *   `toPlayableUrl` 注入。
+ * @property {boolean} [allowOverlap=false] 允许同 kind 尾音重叠（全引擎最多 32 声）。
+ * @property {(kind: string, options: PlayOptions) => boolean} [shouldStart]
+ *   每次异步等待后、实际启动前检查；返回 false 取消本次播放，不记作失败。
  */
 
 /**
@@ -103,15 +109,15 @@ const FAILURE_MESSAGES = {
  * @property {string} [src] 音频 URL、本地绝对路径，或 `local` 源的显示文件名；空字符串表示未配置。
  * @property {ChimeSource} [source] `'url' | 'file' | 'local'`。
  * @property {number} [volume] 0..1，越界钳制。
+ * @property {number} [playbackRate=1] 变速并变调；有限数字钳制到 0.25..4。
+ * @property {AbortSignal} [signal] 阻止已取消的在途播放启动；已开始的声音用 stop 停止。
  */
 
 /**
  * 单个 kind 的运行时状态。
  * @typedef {object} KindState
- * @property {AudioBufferSourceNode|null} sourceNode 正在播放的 BufferSource。
- * @property {GainNode|null} gain 当前播放对应的增益节点（`setVolume` 实时改它）。
- * @property {Audio|null} audio 回退路径的音频元素。
- * @property {string|null} audioUrl 回退元素绑定的 URL。
+ * @property {number} generation stop 时递增，作废该 kind 的所有异步启动。
+ * @property {Set<object>} voices 全部在播或等待元素 play() 的声部。
  */
 
 /**
@@ -125,8 +131,10 @@ const FAILURE_MESSAGES = {
  * - `preview()` 对**未配置（src 为空）**仍按 CONTRACT §4.2 返回 `false`（不算失败），
  *   其余失败一律抛带 `code` 的 Error。
  * - 解码后的 `AudioBuffer` **按最终 URL 字符串**缓存（本地文件 URL 自带 `v` 版本参数，
- *   URL 变了自然重取）。回退用的 `Audio` 元素按 **kind + url** 持有（若按 url 跨 kind 共享，
- *   两个音效会互相抢占实例，破坏"每个音效独立"的语义）。
+ *   URL 变了自然重取），在途 fetch / decode 也合并，失败不永久缓存。
+ * - 默认同 kind 新声音打断旧声音；`allowOverlap: true` 时独立持有每个声部。
+ * - `stop(kind?)` 释放指定 kind（省略则全部）的声部，并作废全部对应在途启动；
+ *   取消的 play / preview 返回 false，不覆盖 lastFailure。
  * - `dispose()` 幂等：停播、abort 在途 fetch、清空缓存、`close()` 上下文。
  *
  * @param {AudioEngineDeps} [deps] 外部依赖。
@@ -135,6 +143,7 @@ const FAILURE_MESSAGES = {
  *   play: (kind: ChimeKind, options?: PlayOptions) => Promise<boolean>,
  *   setVolume: (kind: ChimeKind, volume: number) => number,
  *   preview: (kind: ChimeKind, options?: PlayOptions) => Promise<boolean>,
+ *   stop: (kind?: ChimeKind) => void,
  *   unlock: () => boolean,
  *   lastFailure: (kind: ChimeKind) => Error|null,
  *   dispose: () => void,
@@ -149,6 +158,11 @@ export function createAudioEngine(deps = {}) {
   const states = new Map();
   /** @type {Map<string, { buffer: AudioBuffer }>} 最终 URL → 解码缓存 */
   const urlBuffers = new Map();
+  /** @type {Map<string, Promise<AudioBuffer>>} URL → 共享在途加载 */
+  const urlLoads = new Map();
+  const activeVoices = new Set();
+  const allowOverlap = deps.allowOverlap === true;
+  const cancelled = Symbol('audio playback cancelled');
   /** @type {Map<string, number>} kind → 音量 */
   const volumes = new Map();
   /** @type {Map<string, Error>} kind → 最近一次失败 */
@@ -170,7 +184,7 @@ export function createAudioEngine(deps = {}) {
   function stateFor(kind) {
     let state = states.get(kind);
     if (!state) {
-      state = { sourceNode: null, gain: null, audio: null, audioUrl: null };
+      state = { generation: 0, voices: new Set() };
       states.set(kind, state);
     }
     return state;
@@ -183,39 +197,63 @@ export function createAudioEngine(deps = {}) {
    * @returns {void}
    */
   function stopState(state) {
-    if (state.sourceNode) {
-      const node = state.sourceNode;
-      state.sourceNode = null;
-      try {
-        node.onended = null;
-      } catch {
-        // ignore
+    for (const voice of Array.from(state.voices)) releaseVoice(voice, true);
+  }
+
+  /** 释放单个声部；自然结束和主动停止共用，旧尾音不会误清理新声音。 */
+  function releaseVoice(voice, stopPlayback = false) {
+    if (voice.released) return;
+    voice.released = true;
+    voice.state.voices.delete(voice);
+    activeVoices.delete(voice);
+    const { node, gain, audio } = voice;
+    if (node) {
+      try { node.onended = null; } catch { /* ignore */ }
+      if (stopPlayback) {
+        try { node.stop(); } catch { /* already ended */ }
       }
-      try {
-        node.stop();
-      } catch {
-        // 可能已自然结束，ignore
-      }
-      try {
-        node.disconnect();
-      } catch {
-        // ignore
-      }
+      try { node.disconnect(); } catch { /* ignore */ }
     }
-    if (state.gain) {
-      const gain = state.gain;
-      state.gain = null;
-      try {
-        gain.disconnect();
-      } catch {
-        // ignore
-      }
+    if (gain) {
+      try { gain.disconnect(); } catch { /* ignore */ }
     }
-    if (state.audio) {
-      const audio = state.audio;
-      state.audio = null;
-      state.audioUrl = null;
+    if (audio) {
+      try { audio.onended = null; } catch { /* ignore */ }
       teardownElement(audio);
+    }
+  }
+
+  /** 注册独立声部；只有重叠模式限制总并发，不改变默认通知的打断行为。 */
+  function trackVoice(state, node = null, gain = null, audio = null) {
+    if (!allowOverlap) stopState(state);
+    if (allowOverlap && activeVoices.size >= MAX_VOICES) {
+      releaseVoice(activeVoices.values().next().value, true);
+    }
+    const voice = { state, node, gain, audio, released: false };
+    state.voices.add(voice);
+    activeVoices.add(voice);
+    (node || audio).onended = () => releaseVoice(voice);
+    return voice;
+  }
+
+  /** 检查每个异步边界；stop 不取消共享下载，只取消该调用的启动资格。 */
+  function checkStart(kind, state, generation, opts) {
+    if (disposed) throw createFailure(AUDIO_FAILURES.DISPOSED);
+    if (state.generation !== generation || opts.signal?.aborted) throw cancelled;
+    if (typeof deps.shouldStart === 'function' && !deps.shouldStart(kind, opts)) throw cancelled;
+  }
+
+  /**
+   * 停止某类声音及其全部在途启动；省略 kind 时停止全部。可继续使用引擎。
+   * @param {ChimeKind} [kind] 待停止的种类。
+   * @returns {void}
+   */
+  function stop(kind) {
+    const targets = kind === undefined ? states.values() : [states.get(kind)];
+    for (const state of targets) {
+      if (!state) continue;
+      state.generation += 1;
+      stopState(state);
     }
   }
 
@@ -358,8 +396,22 @@ export function createAudioEngine(deps = {}) {
    * @returns {Promise<AudioBuffer>} 解码结果。
    */
   async function loadBufferFromUrl(url) {
+    if (disposed) throw createFailure(AUDIO_FAILURES.DISPOSED);
     const cached = urlBuffers.get(url);
     if (cached && cached.buffer) return cached.buffer;
+    const pending = urlLoads.get(url);
+    if (pending) return pending;
+    const loading = fetchAndDecode(url);
+    urlLoads.set(url, loading);
+    try {
+      return await loading;
+    } finally {
+      if (urlLoads.get(url) === loading) urlLoads.delete(url);
+    }
+  }
+
+  async function fetchAndDecode(url) {
+    if (disposed) throw createFailure(AUDIO_FAILURES.DISPOSED);
 
     if (typeof fetch !== 'function') {
       throw createFailure(AUDIO_FAILURES.FETCH_FAILED, '当前环境没有 fetch');
@@ -370,6 +422,7 @@ export function createAudioEngine(deps = {}) {
     } catch (error) {
       throw createFailure(AUDIO_FAILURES.FETCH_FAILED, detailOf(error), error);
     }
+    if (disposed) throw createFailure(AUDIO_FAILURES.DISPOSED);
     if (!response) throw createFailure(AUDIO_FAILURES.FETCH_FAILED, '响应无效');
     if (response.ok === false) {
       const status = Number(response.status) || 0;
@@ -393,6 +446,7 @@ export function createAudioEngine(deps = {}) {
       if (error && error.code) throw error;
       throw createFailure(AUDIO_FAILURES.DECODE_FAILED, detailOf(error), error);
     }
+    if (disposed) throw createFailure(AUDIO_FAILURES.DISPOSED);
     urlBuffers.set(url, { buffer });
     return buffer;
   }
@@ -406,51 +460,34 @@ export function createAudioEngine(deps = {}) {
    * @param {number} volume 已钳制音量。
    * @returns {Promise<void>} 播放已启动时 resolve。
    */
-  async function startBuffer(kind, buffer, volume) {
+  async function startBuffer(kind, buffer, volume, opts, state, generation) {
+    checkStart(kind, state, generation, opts);
     const ctx = ensureContext();
     if (!ctx) throw createFailure(AUDIO_FAILURES.NO_BACKEND);
     const running = await waitForRunning(ctx);
+    checkStart(kind, state, generation, opts);
     if (!running) throw createFailure(AUDIO_FAILURES.AUTOPLAY_BLOCKED);
-    if (disposed) throw createFailure(AUDIO_FAILURES.DISPOSED);
-
-    const state = stateFor(kind);
-    stopState(state);
 
     let node = null;
     let gain = null;
+    let voice = null;
     try {
       node = ctx.createBufferSource();
       gain = ctx.createGain();
       node.buffer = buffer;
+      node.playbackRate.value = opts.playbackRate;
       setGainValue(gain, ctx, volume);
       node.connect(gain);
       gain.connect(ctx.destination);
+      voice = trackVoice(state, node, gain);
       node.start(0);
     } catch (error) {
-      try {
-        if (node) node.disconnect();
-      } catch {
-        // ignore
-      }
-      try {
-        if (gain) gain.disconnect();
-      } catch {
-        // ignore
+      if (voice) releaseVoice(voice, true);
+      else {
+        try { if (node) node.disconnect(); } catch { /* ignore */ }
+        try { if (gain) gain.disconnect(); } catch { /* ignore */ }
       }
       throw createFailure(AUDIO_FAILURES.UNSUPPORTED_FORMAT, detailOf(error), error);
-    }
-
-    state.sourceNode = node;
-    state.gain = gain;
-    try {
-      node.onended = () => {
-        if (state.sourceNode === node) {
-          state.sourceNode = null;
-          state.gain = null;
-        }
-      };
-    } catch {
-      // ignore
     }
   }
 
@@ -462,7 +499,8 @@ export function createAudioEngine(deps = {}) {
    * @param {Error|null} priorFailure 回退前发生的失败（作为 cause 保留）。
    * @returns {Promise<void>} 播放已启动时 resolve。
    */
-  async function playElement(kind, url, volume, priorFailure) {
+  async function playElement(kind, url, volume, priorFailure, opts, state, generation) {
+    checkStart(kind, state, generation, opts);
     const Ctor = globalThis.Audio;
     if (typeof Ctor !== 'function') {
       throw createFailure(
@@ -472,41 +510,31 @@ export function createAudioEngine(deps = {}) {
       );
     }
 
-    const state = stateFor(kind);
-    stopState(state);
-
-    let audio = state.audioUrl === url ? state.audio : null;
-    if (!audio) {
-      try {
-        audio = new Ctor(url);
-      } catch (error) {
-        throw createFailure(AUDIO_FAILURES.UNSUPPORTED_FORMAT, detailOf(error), error);
-      }
-      if (!audio || typeof audio.play !== 'function') throw createFailure(AUDIO_FAILURES.NO_BACKEND);
-      state.audio = audio;
-      state.audioUrl = url;
-    }
-
+    let audio;
     try {
-      audio.volume = volume;
-    } catch {
-      // ignore
-    }
-    try {
-      audio.currentTime = 0;
-    } catch {
-      // ignore
-    }
-
-    let played;
-    try {
-      played = audio.play();
+      audio = new Ctor(url);
     } catch (error) {
-      throw elementFailure(error, priorFailure);
+      throw createFailure(AUDIO_FAILURES.UNSUPPORTED_FORMAT, detailOf(error), error);
     }
+    if (!audio || typeof audio.play !== 'function') throw createFailure(AUDIO_FAILURES.NO_BACKEND);
+    try { audio.volume = volume; } catch { /* ignore */ }
+    try { audio.currentTime = 0; } catch { /* ignore */ }
+    try { audio.playbackRate = opts.playbackRate; } catch { /* ignore */ }
+    // 元素默认保调；必须关闭所有可用实现才能得到与 BufferSource 相同的变调。
+    for (const property of ['preservesPitch', 'mozPreservesPitch', 'webkitPreservesPitch']) {
+      try { if (property in audio) audio[property] = false; } catch { /* ignore */ }
+    }
+    const voice = trackVoice(state, null, null, audio);
     try {
-      if (played && typeof played.then === 'function') await played;
+      await audio.play();
+      checkStart(kind, state, generation, opts);
+      if (voice.released) throw cancelled;
     } catch (error) {
+      releaseVoice(voice, true);
+      // play() 可能在 stop 之后才 resolve；再次 pause 防止迟来的元素启动。
+      teardownElement(audio);
+      if (error === cancelled || disposed) throw error;
+      checkStart(kind, state, generation, opts);
       throw elementFailure(error, priorFailure);
     }
   }
@@ -529,11 +557,13 @@ export function createAudioEngine(deps = {}) {
    * `file` / `url` / `local` 在此被 `resolveUrl` 统一成可播放 URL，之后走同一条路径。
    *
    * @param {ChimeKind} kind 音效种类。
-   * @param {{ src: string, source: unknown, volume: unknown }} opts 归一化后的参数。
+   * @param {PlayOptions} opts 归一化后的参数。
    * @returns {Promise<void>} 播放已启动时 resolve。
    */
   async function playOnce(kind, opts) {
-    if (disposed) throw createFailure(AUDIO_FAILURES.DISPOSED);
+    const state = stateFor(kind);
+    const generation = state.generation;
+    checkStart(kind, state, generation, opts);
     const volume = resolveVolume(kind, opts.volume);
     const url = resolveUrl(opts.src, opts.source, kind);
 
@@ -543,9 +573,11 @@ export function createAudioEngine(deps = {}) {
     if (ctx) {
       try {
         const buffer = await loadBufferFromUrl(url);
-        await startBuffer(kind, buffer, volume);
+        await startBuffer(kind, buffer, volume, opts, state, generation);
         return;
       } catch (error) {
+        checkStart(kind, state, generation, opts);
+        if (error === cancelled) throw error;
         const code = error && error.code;
         if (
           code === AUDIO_FAILURES.NO_BACKEND ||
@@ -558,8 +590,10 @@ export function createAudioEngine(deps = {}) {
       }
     }
     try {
-      await playElement(kind, url, volume, priorFailure);
+      await playElement(kind, url, volume, priorFailure, opts, state, generation);
     } catch (error) {
+      checkStart(kind, state, generation, opts);
+      if (error === cancelled) throw error;
       throw pickRootFailure(priorFailure, error);
     }
   }
@@ -621,7 +655,7 @@ export function createAudioEngine(deps = {}) {
     try {
       if (!ensureContext()) return false;
       await loadBufferFromUrl(resolveUrl(path, source, kind));
-      return true;
+      return !disposed;
     } catch {
       return false;
     }
@@ -651,6 +685,7 @@ export function createAudioEngine(deps = {}) {
       failures.delete(kind);
       return true;
     } catch (error) {
+      if (error === cancelled) return false;
       recordFailure(kind, toFailure(error));
       return false;
     }
@@ -668,12 +703,10 @@ export function createAudioEngine(deps = {}) {
     volumes.set(kind, clamped);
     const state = states.get(kind);
     if (state) {
-      if (state.gain) setGainValue(state.gain, context, clamped);
-      if (state.audio) {
-        try {
-          state.audio.volume = clamped;
-        } catch {
-          // ignore
+      for (const voice of state.voices) {
+        if (voice.gain) setGainValue(voice.gain, context, clamped);
+        if (voice.audio) {
+          try { voice.audio.volume = clamped; } catch { /* ignore */ }
         }
       }
     }
@@ -702,6 +735,7 @@ export function createAudioEngine(deps = {}) {
       failures.delete(kind);
       return true;
     } catch (error) {
+      if (error === cancelled) return false;
       const failure = toFailure(error);
       recordFailure(kind, failure);
       throw failure;
@@ -738,6 +772,7 @@ export function createAudioEngine(deps = {}) {
   function dispose() {
     if (disposed) return;
     disposed = true;
+    stop();
     try {
       if (lifecycle) lifecycle.abort();
     } catch {
@@ -749,6 +784,7 @@ export function createAudioEngine(deps = {}) {
       states.delete(kind);
     }
     urlBuffers.clear();
+    urlLoads.clear();
     volumes.clear();
     failures.clear();
 
@@ -764,7 +800,7 @@ export function createAudioEngine(deps = {}) {
     }
   }
 
-  return { prepare, play, setVolume, preview, unlock, lastFailure, dispose };
+  return { prepare, play, setVolume, preview, stop, unlock, lastFailure, dispose };
 }
 
 // ------------------------------------------------------------ 小工具
@@ -817,11 +853,16 @@ function detailOf(error) {
 /**
  * 归一化播放参数。
  * @param {unknown} options 原始参数。
- * @returns {{ src: string, source: unknown, volume: unknown }} 归一化结果。
+ * @returns {PlayOptions} 归一化结果（playbackRate 总为有限数字）。
  */
 function normalizeOptions(options) {
   const opts = options && typeof options === 'object' ? options : {};
-  return { src: normalizeSrc(opts.src), source: opts.source, volume: opts.volume };
+  const playbackRate = typeof opts.playbackRate === 'number' && Number.isFinite(opts.playbackRate)
+    ? Math.min(4, Math.max(0.25, opts.playbackRate)) : 1;
+  return {
+    src: normalizeSrc(opts.src), source: opts.source, volume: opts.volume,
+    playbackRate, signal: opts.signal,
+  };
 }
 
 /**

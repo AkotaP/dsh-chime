@@ -47,12 +47,6 @@ import { getLocalAudioUrl } from './localAudioStore.js';
  */
 export const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.webm'];
 
-/** host half 提供的音频字节路由。 */
-const ASSET_ROUTE = '/dsh-chime/asset';
-
-/** host half 提供的目录枚举路由。 */
-const LIST_ROUTE = '/dsh-chime/list';
-
 /** 带协议头的 URL（`scheme://…`，如 `https://`、`http://`）。 */
 const SCHEME_URL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
@@ -107,9 +101,10 @@ export function isLocalPath(src) {
  * @param {unknown} src 音源：http(s) URL、本地绝对路径，或 `'local'` 下的显示文件名。
  * @param {unknown} source 来源类型：`'url' | 'file' | 'local'`。
  * @param {unknown} [kind] 音效种类；**仅 `source === 'local'` 时使用**（IndexedDB 键）。
+ * @param {string} [routePrefix='/dsh-chime'] 组件自身的音源路由前缀。
  * @returns {string} 可播放 URL；未配置 / 未就绪时为 `''`。
  */
-export function toPlayableUrl(src, source, kind) {
+export function toPlayableUrl(src, source, kind, routePrefix = '/dsh-chime') {
   if (source === 'local') {
     try {
       const key = typeof kind === 'string' ? kind.trim() : '';
@@ -126,7 +121,7 @@ export function toPlayableUrl(src, source, kind) {
   if (value === '') return '';
   if (source !== 'file') return src;
 
-  return `${ASSET_ROUTE}?path=${encodeURIComponent(value)}`;
+  return `${routePrefix}/asset?path=${encodeURIComponent(value)}`;
 }
 
 /**
@@ -152,12 +147,13 @@ export function toPlayableUrl(src, source, kind) {
  * **失败一律抛错，绝不静默返回 `null` / 空结果**：静默失败在 UI 上就是"点了没反应"。
  *
  * @param {object} ctx Client 根 Context。
+ * @param {{routePrefix?: string}} [options] 组件自身的资源路由；默认保留通知路由。
  * @returns {{
  *   pickDirectory: (signal?: AbortSignal) => Promise<string|null>,
  *   listAudioFiles: (path: string, signal?: AbortSignal) => Promise<ChimeBrowseResult>,
  * }} 浏览器。
  */
-export function createFileBrowser(ctx) {
+export function createFileBrowser(ctx, { routePrefix = '/dsh-chime' } = {}) {
   return {
     /**
      * 打开 host 原生目录选择器。
@@ -209,7 +205,7 @@ export function createFileBrowser(ctx) {
         throw new Error('列出目录失败：当前环境不支持 fetch');
       }
 
-      const url = `${LIST_ROUTE}?path=${encodeURIComponent(dir)}`;
+      const url = `${routePrefix}/list?path=${encodeURIComponent(dir)}`;
       const init = signal === undefined || signal === null ? {} : { signal };
 
       let response;

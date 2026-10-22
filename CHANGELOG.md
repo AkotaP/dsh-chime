@@ -6,6 +6,23 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.7.0-playground] — not released
+
+### Added
+
+- Optional, default-disabled experience-orb component with its own client lifecycle, local audio routes, configuration page and storage. Any new tool result in the current session starts a uniformly sampled burst; duration bounds and orb frequency are configurable. Repeated triggers merge without multiplying playback loops; history and reconnect baselines never replay sounds.
+- MC-style triangular random playback rate (0.55–1.25), overlapping tails, independent volume, foreground-only default, single-note and 10-second rhythm previews. No bundled or automatically downloaded sound files.
+- Backward-compatible audio-engine options for playback rate, opt-in overlap, cancellation and shared in-flight decoding; notification playback retains its default interruption behavior.
+
+### Fixed
+
+- Experience-orb component titles now use exported Chinese/English metadata instead of a `file:///...` entry path. The component is a named, bundled workspace dependency; existing row and settings identifiers are preserved.
+
+### Changed
+
+- Minimum DSH version is now 0.2.1-rc.2 for portable embedded-component addressing and independent client discovery.
+- The long-lived playground branch uses the next minor version above its main baseline, a patch counter for playground iterations, and the `-playground` suffix. The main package and bundled XP component share the same version.
+
 ## [0.6.0] — not released
 
 ### Added

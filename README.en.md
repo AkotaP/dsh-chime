@@ -33,9 +33,15 @@ Changes take effect immediately; there is no save button.
 
 ![Configuration UI](docs/img/ui.png)
 
+## Optional experience-orb component
+
+The component list includes a default-disabled **Experience orbs** row (`chime-xp`). Enable the row, open its own configuration page, supply an audio source, and enable automatic XP sounds. Any new tool result in the current session starts a burst with configurable random duration bounds and orb frequency. The notification component can be disabled independently; its configuration remains untouched.
+
+Defaults: 1–3 seconds, 6 orbs/second, 10% volume, pause when unfocused. Includes single-note and 10-second rhythm previews. No MC audio is included or downloaded. See [experience-orb rules and configuration](docs/xp-orbs.en.md).
+
 ## Install
 
-> Installing changes the profile configuration under `%USERPROFILE%\.dsh` and requires restarting DSH (which interrupts running sessions). Please confirm first.
+> Installing changes the profile configuration under `%USERPROFILE%\.dsh`; confirm first. HMR-enabled profiles normally recompose live. Do not automatically restart DSH or interrupt running sessions.
 
 Repository: <https://github.com/AkotaP/dsh-chime>
 
@@ -51,11 +57,11 @@ dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime
 
 **Let the agent install it** (paste this into a DSH agent):
 
-> Install this repository into the current DSH `desktop` profile: `https://github.com/AkotaP/dsh-chime`. Use the sidebar **Plugins** page's **Add plugin**, or `dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime`. After installing, confirm `dsh-chime` is present in the profile's `dsh.profile.bundles`, then **ask me first** before restarting DSH. After the restart, confirm the **Chime** card on the Plugins page opens the configuration form.
+> Install this repository into the current DSH `desktop` profile: `https://github.com/AkotaP/dsh-chime`. Use the sidebar **Plugins** page's **Add plugin**, or `dsh plugin --profile desktop add https://github.com/AkotaP/dsh-chime`. After installing, confirm `dsh-chime` is present in the profile's `dsh.profile.bundles`, then confirm the **Chime** card on the Plugins page opens the configuration form. Ask separately only if the host explicitly reports that a restart is required; do not restart automatically.
 
 **Local development** (link a checkout into a profile so source changes apply live): see [Development](#development) below.
 
-After installing, **restart DSH**; the **Chime** card on the Plugins page shows the configuration form. To uninstall: remove it from the **Plugins** page, or `dsh plugin --profile desktop remove dsh-chime` (and confirm the entry is gone from `dsh.profile.bundles`).
+After installing, confirm the application state and configuration form on the Plugins page. Ask separately before restarting only if the host explicitly requires it. To uninstall: remove it from the **Plugins** page, or `dsh plugin --profile desktop remove dsh-chime` (and confirm the entry is gone from `dsh.profile.bundles`).
 
 ## How it works
 
@@ -73,7 +79,7 @@ After installing, **restart DSH**; the **Chime** card on the Plugins page shows 
 
 ```bash
 pnpm install
-node build.mjs                 # emits lib/index.js and lib/client.js
+node build.mjs                 # emits notification and XP host/client bundles
 node test/detect.test.mjs      # 43 event-detection cases
 node tools/verify-apply.mjs    # activates the client half against a stub context
 node tools/verify-host-routes.mjs
@@ -93,7 +99,7 @@ Release history is in [`CHANGELOG.md`](./CHANGELOG.md).
 ## Compatibility
 
 - Node.js `>=20`
-- DSH `>=0.2.0-rc.2`
+- DSH `>=0.2.1-rc.2`
 
 ## License
 
