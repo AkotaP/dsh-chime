@@ -2221,7 +2221,7 @@ window.__ModuleLoader__.load({
     }
 
     // src/xp/index.js
-    var inject = ["slots", "locale", "sessions", "uiSession", "uiWorkspace"];
+    var inject = ["slots", "locale", "sessions", "uiSession", "uiSession.sessionStatus", "uiWorkspace"];
     var ROUTE = "/dsh-chime-xp";
     function apply(ctx) {
       const configStore = createConfigStore();
