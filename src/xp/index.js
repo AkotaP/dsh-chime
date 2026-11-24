@@ -9,7 +9,7 @@ import { createToolResultWatcher } from './tools.js';
 import { XpSettings, XpSummary } from './settings.jsx';
 import { NS, zh, en } from './locale.js';
 
-export const inject = ['slots', 'locale', 'sessions', 'uiSession', 'uiWorkspace'];
+export const inject = ['slots', 'locale', 'sessions', 'uiSession', 'uiSession.sessionStatus', 'uiWorkspace'];
 const ROUTE = '/dsh-chime-xp';
 
 export function apply(ctx) {

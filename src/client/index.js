@@ -23,7 +23,7 @@ import { createPresence } from './presence.js';
 import { ChimeSettings, ChimeSummary } from './settings.jsx';
 
 /** Hard dependencies resolved before `apply` runs. */
-export const inject = ['slots', 'locale', 'sessions', 'remote', 'uiSession', 'uiWorkspace'];
+export const inject = ['slots', 'locale', 'sessions', 'remote', 'uiSession', 'uiSession.sessionStatus', 'uiWorkspace'];
 
 /** Package name; also the browser module id used by the bundle wrapper. */
 const PACKAGE_NAME = 'dsh-chime';

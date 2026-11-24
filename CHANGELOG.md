@@ -6,6 +6,10 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+### Fixed
+
+- 适配 DSH 0.2.3：客户端与 XP 组件的 `inject` 增加 `'uiSession.sessionStatus'`。该名字自 0.2.3 起是需要注入的独立子服务，未注入时读取会抛错，检测轮整轮被跳过——音效与通知都不会触发，且不报错。
+
 ## [0.7.1-playground.1] — not released
 
 ### Fixed
