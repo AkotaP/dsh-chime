@@ -1301,3 +1301,72 @@ test('深度缓存随会话消失清理：重新出现时重新计算父链', ()
   assert.deepEqual(h.kinds(), ['approval', 'approval']);
   assert.deepEqual(reads, { p1: 2, p2: 2 }, '缓存清理后必须重新计算父链');
 });
+// ---------------------------------------------------------------------------
+// 宿主阅读记录（DSH 0.2.3+）：未读门控与失败分类
+// ---------------------------------------------------------------------------
+
+test('阅读基线就绪：别的会话的完成已经被读过 → 不补响 completed', async () => {
+  // 后台会话只走通知通道，所以先把通知打开，否则「没响」分不清是门控还是通道关闭。
+  const h = createHarness({ config: { notify: { enabled: true } }, deps: { isReadingReady: () => true } });
+  const list = listOf({ ids: ['b1'], rows: { b1: bgRow('b1') } });
+
+  h.detector.evaluate(statuses({ b1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ b1: st({ running: false, completionUnread: false }) }), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS + 10);
+
+  assert.deepEqual(h.kinds(), [], '宿主说这一轮已经读过，说明用户已在别处看过');
+});
+
+test('阅读基线就绪：别的会话完成且未读 → 照响 completed', async () => {
+  const h = createHarness({ config: { notify: { enabled: true } }, deps: { isReadingReady: () => true } });
+  const list = listOf({ ids: ['b1'], rows: { b1: bgRow('b1') } });
+
+  h.detector.evaluate(statuses({ b1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ b1: st({ running: false, completionUnread: true }) }), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS + 10);
+
+  assert.deepEqual(h.kinds(), ['completed']);
+});
+
+test('阅读基线就绪：失败回合发 interrupted 而不是 completed', async () => {
+  const h = createHarness({ deps: { isReadingReady: () => true } });
+  const list = soloList();
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(
+    statuses({ s1: st({ running: false, completionUnread: true, completionFailed: true }) }),
+    list,
+    new Map(),
+  );
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS + 10);
+
+  assert.deepEqual(h.kinds(), ['interrupted'], '失败回合用失败音，不用完成音');
+});
+
+test('失败回合已由错误沿响过 → 完成判定不再补一声', async () => {
+  const h = createHarness({ deps: { isReadingReady: () => true } });
+  const list = soloList();
+  const failed = () =>
+    statuses({ s1: st({ running: false, lastAgentError: 'boom', completionUnread: true, completionFailed: true }) });
+
+  h.detector.evaluate(statuses({ s1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(failed(), list, new Map());
+  assert.deepEqual(h.kinds(), ['interrupted'], '错误沿先响一次');
+
+  // 再走一次求值把完成防抖武装起来，等它到期
+  h.detector.evaluate(failed(), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS + 10);
+
+  assert.deepEqual(h.kinds(), ['interrupted'], '同一回合只响一声，不追加 completed');
+});
+
+test('阅读基线未就绪（旧宿主 / LiveShare）：不看未读，完成照响', async () => {
+  const h = createHarness({ config: { notify: { enabled: true } } });
+  const list = listOf({ ids: ['b1'], rows: { b1: bgRow('b1') } });
+
+  h.detector.evaluate(statuses({ b1: st({ running: true }) }), list, new Map());
+  h.detector.evaluate(statuses({ b1: st({ running: false, completionUnread: false }) }), list, new Map());
+  await h.clock.advance(COMPLETION_DEBOUNCE_MS + 10);
+
+  assert.deepEqual(h.kinds(), ['completed'], '拿不到阅读记录时退回本地判定');
+});

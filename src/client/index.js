@@ -158,6 +158,46 @@ function sessionTitleOf(ctx, sessionId) {
 }
 
 /**
+/**
+ * 取宿主的阅读记录服务（DSH 0.2.3+ 的 `ctx.uiSession.sessionStatus`）。
+ *
+ * 这个服务是独立注册的子服务，**读它必须注入**（见插件 `inject`）；旧宿主没有
+ * `readingReady` 成员，此时返回的对象也拿不到未读/失败信息，调用方按「未就绪」处理。
+ *
+ * @param {object} ctx Client 根 Context。
+ * @returns {any} 服务对象；不可用时 undefined。
+ */
+function readingService(ctx) {
+  try {
+    return ctx?.get?.('uiSession')?.sessionStatus;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 把某个会话在宿主阅读记录里标为已读（`sessionStatus.mark(id, false)`）。
+ *
+ * 只用来兑现「点了通知就等于看过了」：桌面外壳未必真把窗口拉到前台，宿主也就不会
+ * 自动确认阅读，徽标会一直挂着。标记失败只影响徽标，不影响通知本身。
+ *
+ * @param {object} ctx Client 根 Context。
+ * @param {unknown} sessionId 目标会话 id。
+ */
+function markRead(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+  const service = readingService(ctx);
+  // 阅读基线没就绪时宿主会拒绝标记；此时跳过，别把一次拒绝写进日志。
+  if (service?.readingReady !== true) return;
+  try {
+    const pending = service.mark?.(sessionId, false);
+    if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+  } catch {
+    // 标记失败不影响通知：徽标最多保留。
+  }
+}
+
+/**
  * 把 DSH 主区域切到事件所属会话（CONTRACT §4.7）。
  *
  * `ctx.uiWorkspace.openSession(id)` 是 ui-workspace 文档化的客户端 API：它同步替换
@@ -320,12 +360,16 @@ export function apply(ctx) {
       }
       revealSession(ctx, event?.sessionId);
       raiseDesktopWindow(configStore.getSnapshot());
+      // 点掉一条完成类通知就等于看过这一轮：顺手清掉宿主的未读标记，免得桌面没把
+      // 窗口拉到前台时徽标一直挂着。审批/提问不改阅读状态，它们不是「完成」。
+      if (event?.kind === 'completed' || event?.kind === 'interrupted') markRead(ctx, event?.sessionId);
     },
   });
 
   const detector = createDetector({
     getConfig: () => configStore.getSnapshot(),
     isFocused: () => presence.focused(),
+    isReadingReady: () => readingService(ctx)?.readingReady === true,
     getStatuses: () => {
       const uiSession = ctx.get('uiSession');
       return uiSession?.sessionStatus?.getSnapshot?.() ?? new Map();

@@ -10,6 +10,11 @@ No version has been released yet, so the entries below carry no release dates, a
 
 - DSH 0.2.3: the client `inject` now lists `'uiSession.sessionStatus'`. The session status table became an injected service, and reading it without the inject throws inside the detector's first `try` block, which skipped every evaluation round - chimes and notifications stopped firing without an error.
 
+### Changed
+
+- Completion and failure now come from the host reading records: `completionUnread` says whether the round is still unseen, `completionFailed` says it ended in an error, and `readingReady` says whether the baseline is available. A completion the user already read elsewhere no longer rings on arrival, and a failed turn rings the interrupted sound instead of the completion one, without a second chime when the error edge already fired. Everything falls back to the previous detection while the baseline is unavailable (older hosts, LiveShare viewers).
+- Clicking a completion notification calls `sessionStatus.mark(id, false)` so that round counts as read: when the desktop shell fails to raise the window the host never confirms the read, and the badge would stay behind. Approval and question notifications leave the read state alone.
+
 ## [0.6.1] — not released
 
 ### Fixed
