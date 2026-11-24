@@ -6,6 +6,8 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+## [0.7.0-playground.1.0] — not released
+
 ### Fixed
 
 - 适配 DSH 0.2.3：客户端与 XP 组件的 `inject` 增加 `'uiSession.sessionStatus'`。该名字自 0.2.3 起是需要注入的独立子服务，未注入时读取会抛错，检测轮整轮被跳过——音效与通知都不会触发，且不报错。
@@ -14,6 +16,7 @@ No version has been released yet, so the entries below carry no release dates, a
 
 - 完成与失败改用宿主的阅读记录判定：`completionUnread` 说这一轮还没被看过、`completionFailed` 说它是失败结束、`readingReady` 说基线是否就绪。据此，别的会话**已经读过的完成不再补响**，失败回合发 `interrupted`（失败音）而不是 `completed`，同一回合已由错误沿响过时也不再补一声。基线未就绪（旧宿主、LiveShare 只读视图）时全部退回原有的本地判定，行为不变。
 - 点掉一条完成类通知会调用 `sessionStatus.mark(id, false)` 把那一轮标为已读：桌面外壳没真把窗口拉到前台时，宿主的自动确认不会发生，徽标不该一直挂着。审批与提问通知不改阅读状态。
+- 版本号规则改为与 `main` 完全同步前缀、后缀两段计数：`M.m.p-playground.<迭代>.<重发>`（如 `0.7.0-playground.1.0`），基线随 `main` 移动时两段都从起点重新开始；规则同步写进 README、README.en 与 CONTRACT §8。
 
 ## [0.7.1-playground.1] — not released
 

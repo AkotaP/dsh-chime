@@ -97,8 +97,8 @@ node tools/link-install.mjs web
 
 ## 分支版本
 
-- `main` 使用 `M.m.p`；`playground` 使用 `M.(m+1).p-playground.n`。第一段相同，第二段比主线大 1，第三段与主线同步；`n` 单独记录 playground 自身更新。
-- 例如主线为 `0.6.1` 时，对应 `0.7.1-playground.1`；playground 再次独立更新后为 `0.7.1-playground.2`。主包与 XP 子包版本一致，预发布使用独立 `playground` 渠道。
+- `main` 使用 `M.m.p`；`playground` 用同一个 `M.m.p` 再加两段预发布后缀 `-playground.<迭代>.<重发>`。基线版本与 `main` 完全一致：`<迭代>` 每次本分支自身更新 +1，`<重发>` 是同一迭代内的重发号（首次为 0）。
+- 例如主线为 `0.7.0` 时，对应 `0.7.0-playground.1.0`；playground 再次独立更新后为 `0.7.0-playground.2.0`，基线随 `main` 移动时两段都从起点重新开始。主包与 XP 子包版本一致，预发布使用独立 `playground` 渠道。
 
 ## 兼容性
 

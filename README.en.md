@@ -98,8 +98,8 @@ Release history is in [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Branch versions
 
-- Main uses `M.m.p`; playground uses `M.(m+1).p-playground.n`. The major matches main, the minor is always one higher, and the patch follows main. The independent `n` counter records playground-only iterations.
-- For main `0.6.1`, an example is `0.7.1-playground.1`; the next playground-only update is `0.7.1-playground.2`. The main package and XP subpackage share an identical version, and prereleases use the separate `playground` channel.
+- Main uses `M.m.p`; playground uses the same `M.m.p` plus a two-segment `-playground.<iteration>.<revision>` prerelease suffix. The base version matches main exactly: `<iteration>` increments for every playground-only update, and `<revision>` counts re-releases of the same iteration, starting at 0.
+- For main `0.7.0`, an example is `0.7.0-playground.1.0`; the next playground-only update is `0.7.0-playground.2.0`, and both segments restart when the base moves with main. The main package and XP subpackage share an identical version, and prereleases use the separate `playground` channel.
 
 ## Compatibility
 
