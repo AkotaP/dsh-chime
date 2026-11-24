@@ -17,6 +17,10 @@
  *   （`running === false`）时才响；重试期间的瞬时错误（running 仍为 true，
  *   或重试成功后错误被清空）一律不响（§3.4，需求 4）。
  * - `completed` 走「曾活跃 → 全空闲 → 防抖到期」三段式复合判定（§3.5）。
+ * - 宿主阅读记录（DSH 0.2.3+ 的 `completionUnread` / `completionFailed`，由 `isReadingReady`
+ *   报告基线是否就绪）只做两件本地判定做不到的事：**别的会话已经读过的完成不再补响**、
+ *   **失败回合发 `interrupted` 而不是 `completed`**。基线未就绪时这两条自动失效，
+ *   行为与旧宿主一致。
  * - `completed` 另有一道**最短任务时长门槛**：距该会话最后一条用户消息不足
  *   `config.completionMinSeconds` 秒就不响，避免小任务频繁响铃。门槛只决定
  *   「这一次响不响」，不参与内部状态推进；拿不到时间戳或配置没给该字段时**照响**
@@ -262,6 +266,7 @@ function readActiveJobs(activeJobs, id) {
  * @param {(sessionId: string) => (string | null | undefined)} [deps.getAgentError] 可选：直接读最终错误。
  * @param {(sessionId: string) => any} [deps.getSessionSnapshot] 可选：读 `SessionSnapshot`。
  * @param {(sessionId: string) => (number | null | undefined)} [deps.getLastUserMessageTime] 可选：读该会话最后一条用户消息的时间戳（毫秒，与 `now` 同源）。
+ * @param {() => boolean} [deps.isReadingReady] 可选：宿主阅读记录是否就绪（`ctx.uiSession.sessionStatus.readingReady`）。
  * @param {() => boolean} [deps.isFocused] 可选：窗口此刻是否拥有焦点（默认 `() => true`，即视为在场）。
  * @param {() => number} [deps.now] 可选：当前时间戳。
  * @param {(fn: () => void, ms: number) => unknown} [deps.setTimeout] 可选：定时器。
@@ -281,6 +286,7 @@ export function createDetector(deps) {
     getAgentError = null,
     getSessionSnapshot = null,
     getLastUserMessageTime = null,
+    isReadingReady = () => false,
     isFocused = () => true,
     now = () => Date.now(),
     setTimeout: schedule = (fn, ms) => setTimeout(fn, ms),
@@ -568,6 +574,14 @@ export function createDetector(deps) {
     /** @type {ChimeEvent[]} */
     const emitted = [];
     const ids = collectSessionIds(statuses, sessionList);
+    // 宿主阅读记录（DSH 0.2.3+）是否就绪：未就绪时 `completionUnread` / `completionFailed`
+    // 恒为 false（LiveShare 只读视图、旧宿主、流未连上），此时退回纯本地判定。
+    let readingReady = false;
+    try {
+      readingReady = isReadingReady() === true;
+    } catch (error) {
+      report(error, 'isReadingReady');
+    }
 
     for (const id of ids) {
       const state = stateOf(id);
@@ -583,6 +597,9 @@ export function createDetector(deps) {
       // 列表里查不到该会话时（例如启动期 `list.phase === 'pending'`）无法证明它是
       // 背景会话，按「激活」处理，避免漏掉主会话的第一次审批。
       const isActiveSession = row === undefined || (row.retainedBy?.mainView ?? 0) > 0;
+      // 宿主阅读记录：完成是否已读、最近一个完成的轮次是否失败。未就绪时恒为 false。
+      const unread = status?.completionUnread === true;
+      const completionFailed = status?.completionFailed === true;
       // 提醒时机（CONTRACT §3.7）：音效与通知是两条**独立**通道，各按自己的策略判定
       // 「此刻要不要打扰」。两者的策略都建立在同一份在场感（窗口焦点）与同一个
       // 「事件是否来自当前会话」之上 —— 共用信号，所以不会出现 Codex 那种
@@ -637,6 +654,8 @@ export function createDetector(deps) {
       if (interruptedRising) state.errorFired = true;
 
       // 6) 同一会话同一 tick 只取优先级最高的一个：approval > question > interrupted > completed。
+      // 失败回合发 interrupted 而不是 completed（宿主的 completionFailed，未就绪时退回本地错误）。
+      const failedCompletion = readingReady ? completionFailed : errorActive;
       const kind = approvalRising
         ? 'approval'
         : questionRising
@@ -644,9 +663,14 @@ export function createDetector(deps) {
           : interruptedRising
             ? 'interrupted'
             : completed
-              ? 'completed'
+              ? (failedCompletion ? 'interrupted' : 'completed')
               : null;
       if (kind === null) continue;
+      // 失败回合已经由错误沿响过：同一回合只响一声。
+      if (kind === 'interrupted' && !interruptedRising && state.errorFired) continue;
+      // 宿主说「这个会话的完成已经读过了」，而且它不是用户正在看的那个：说明已经在别处看过，
+      // 不再打扰。只在阅读基线就绪时判定；当前会话的提醒时机仍由 attention 决定。
+      if (completed && readingReady && !isActiveSession && !unread) continue;
 
       // 音效与通知都不需要时静默；状态照常推进，避免解禁后补响旧事件。
       if (!reportable) continue;

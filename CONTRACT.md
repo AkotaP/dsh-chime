@@ -74,15 +74,20 @@ window.__ModuleLoader__.load({
 
 ### 2.2 会话状态源（核心）
 
-`ctx.get('uiSession').sessionStatus` 是 `ObservableSnapshot<Map<SessionId, SessionStatus>>`（证据 `.probe/ui-session-client.js:147-156,342-358`）：
+`ctx.uiSession.sessionStatus` 是会话状态表。**DSH 0.2.3 起它是需要注入的独立子服务**：客户端 `inject` 里要有 `'uiSession.sessionStatus'`，否则读该属性直接抛 `cannot get property ... without inject`。`getSnapshot()` / `subscribe()` 给出 `Map<SessionId, SessionStatus>`（证据：`dsh-client-ui-session-status` 的 `README.zh.md` 与 `src/client/status.ts`）：
 
 ```ts
 type SessionStatus = {
   running: boolean | undefined;
   pendingInteraction: PendingInteraction | undefined;
+  /** 宿主阅读记录：这一轮完成且用户还没看过（可见且聚焦地打开该会话时不计）。 */
   completionUnread: boolean;
+  /** 未读，且最近一个完成的轮次以宿主观察到的执行错误结束。 */
+  completionFailed: boolean;
 };
 ```
+
+服务上另有两个成员：`readingReady`（前端是否已取得宿主阅读基线；LiveShare 只读视图下恒为 false）与 `mark(sessionId, unread)`（标为已读/未读；基线未就绪时拒绝）。**基线没就绪时 `completionUnread` / `completionFailed` 恒为 false**，插件据此退回纯本地判定（§3.5）。
 
 在 **slot 组件**里用 standard prop `useSessionStatus(selector)` 更规范（证据 `settings.section` catalog 的 `standardProps`）。
 
@@ -207,6 +212,7 @@ status.pendingInteraction?.kind === 'question' || === 'plan-review'
 - `activeJobCount`：`ctx.remote.job.list({sessionId})` 流的最新帧里 `status ∈ {'running','stopping'}` 的条数。
 - 从 `running === true` 开始跟踪，只有**观察到过 running（或 job 活跃）之后再落到全空闲**，才算一次完成 —— 防止初始状态误触发。
 - 需要一个**防抖窗口**（建议 1200ms）：窗口内若 `running` 回到 true 或出现新 job，则取消本次完成。
+- **宿主阅读记录优先（0.2.3+）**：`readingReady === true` 时，`completionUnread === false` 且事件来自非当前会话 → 说明这一轮用户已经在别处读过，不再补响；`completionFailed === true` → 发 `interrupted` 的失败音而不是完成音，且同一回合已经由错误沿响过时不再补一声。基线未就绪（旧宿主、LiveShare）退回上面的本地判定。
 
 ### 3.6 多会话
 
@@ -244,7 +250,7 @@ status.pendingInteraction?.kind === 'question' || === 'plan-review'
 - `completionMinSeconds` 与 `maxDepth` 两道既有门槛依旧独立生效，且对两条通道一视同仁。
 - 音效与通知共用同一个函数、同一份在场感是**刻意的**：Codex 桌面端出过「系统通知关了声、
   提示音照响」的错位，共用判定就不会有这个问题。
-- 注意 DSH 的 `completionUnread` 只对非主会话置位（证据 `.probe/ui-session-client.js:314-321`），可作参考但**不要直接依赖它**，因为主会话永远为 false。
+- 宿主阅读记录（`completionUnread` / `completionFailed` / `readingReady` / `mark`）是 0.2.3 起判定「完成、失败、有没有读过」的真值来源：本地「活跃过 + 防抖」只负责时机。**旧结论（`completionUnread` 只对非主会话置位、主会话恒为 false）在 0.2.3 已不成立**——现在它与阅读记录一致，只在该会话可见且聚焦地打开时不置位。点掉一条完成类通知时插件调用 `mark(id, false)` 把这一轮标为已读（桌面没能把窗口拉到前台时，宿主的自动确认不会发生）。
 
 ---
 
