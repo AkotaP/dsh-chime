@@ -6,6 +6,10 @@ No version has been released yet, so the entries below carry no release dates, a
 
 ## [Unreleased]
 
+### Fixed
+
+- DSH 0.2.3: the client `inject` now lists `'uiSession.sessionStatus'`. The session status table became an injected service, and reading it without the inject throws inside the detector's first `try` block, which skipped every evaluation round - chimes and notifications stopped firing without an error.
+
 ## [0.6.1] — not released
 
 ### Fixed
